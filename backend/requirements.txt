@@ -1,0 +1,41 @@
+# FastAPI & Server
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+python-dotenv==1.0.1
+
+# PDF Processing
+pdfplumber==0.11.4
+PyPDF2==3.0.1
+
+# NLP & NER
+spacy==3.7.5
+transformers==4.44.0
+torch>=2.0.0
+tokenizers==0.19.1
+
+# Embeddings & Retrieval
+sentence-transformers==3.0.1
+faiss-cpu==1.8.0
+
+# Cross-Encoder
+# (included in sentence-transformers)
+
+# LLM Integration
+openai==1.40.0
+httpx==0.27.0
+
+# Evaluation
+rouge-score==0.1.2
+scikit-learn==1.5.1
+numpy>=1.24.0
+
+# NLI (Hallucination Detection)
+# Uses transformers (already included)
+
+# Utilities
+pydantic==2.8.0
+aiofiles==24.1.0
+tqdm==4.66.5
+loguru==0.7.2
+orjson==3.10.7
