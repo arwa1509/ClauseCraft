@@ -117,7 +117,7 @@ class RAGGenerator:
         """
         if not passages:
             return json.dumps({
-                "simple_answer": "No relevant passages were found to answer this question.",
+                "simple_answer": "No relevant passages were found in the document corpus to answer this question.",
                 "supporting_text": "",
                 "key_entities": [],
                 "confidence": 0.0
@@ -139,41 +139,91 @@ class RAGGenerator:
         for sent in sentences:
             sent_words = set(sent.lower().split())
             if not query_words or not sent_words:
-                score = 0
+                score = 0.0
             else:
                 intersection = len(query_words.intersection(sent_words))
                 union = len(query_words.union(sent_words))
                 score = intersection / union
+                
+            # Sentence intent scoring logic
+            if intent == "reasoning":
+                if any(w in sent.lower() for w in ["false", "because", "reason", "not", "fabricated", "not involved", "civil dispute", "not required", "no criminal case"]):
+                    score += 0.8
+                if any(w in sent.lower() for w in ["prayer", "it is therefore prayed", "pray"]):
+                    score -= 2.0
+            elif intent == "condition":
+                if any(w in sent.lower() for w in ["shall", "if", "may"]):
+                    score += 0.3
+            elif intent == "external_web":
+                 # Slightly boost web results so they show up for out-of-context queries 
+                 if len(sent) > 50:
+                     score += 0.4
+
             scored_sentences.append((score, sent))
             
         # Sort and take top 1 to 2 sentences to form simple answer
         scored_sentences.sort(key=lambda x: x[0], reverse=True)
         
         # Select best 2 sentences (if available) and maintain their original order
-        best_sents = [s for _, s in scored_sentences[:2]]
-        ordered_best = [s for s in sentences if s in best_sents]
-        simple_answer = " ".join(ordered_best)
-        
-        if not simple_answer.strip():
-            simple_answer = "Could not extract a specific sentence, but the document may be relevant."
+        best_scored = [item for item in scored_sentences[:3] if item[0] > 0]
 
+        # Properly formulate the extracted sentences so it reads coherently rather than fragments.
+        if len(best_scored) > 0:
+            best_sents = [s for _, s in best_scored]
+            ordered_best = [s for s in sentences if s in best_sents]
+            extracted_core = " ".join(ordered_best)
+            
+            # Clean output (e.g., remove numberings, simplify)
+            import re
+            extracted_core = re.sub(r'^\d+\.\s*', '', extracted_core)
+            extracted_core = re.sub(r'\(\w\)', '', extracted_core)
+            
+            simple_answer = f"Based on the provided context, {extracted_core[0].lower()}{extracted_core[1:]}"
+            if not simple_answer.endswith('.'): 
+                simple_answer += "."
+        else:
+            simple_answer = "This query does not appear to be within the context of the provided legal documents or law."
+            
+        # Grab source metadata
+        meta = best_passage.get("metadata", {})
+        
         # Grab key entities from the passage to display
         key_entities = list(set([e.get("text", "") + f" ({e.get('label', '')})" for e in passage_entities if isinstance(e, dict)]))
         
         # Calculate a normalized confidence score [0, 1.0] from arbitrary retrieval scores
-        raw_score = best_passage.get("score", 0.0)
-        
+        retrieval_score = best_passage.get("score", 0.0)
+        # Normalized logic for 0-1, handle <0 and >1 gracefully
+        if retrieval_score < 0:
+             retrieval_score = 0
+        if retrieval_score > 1:
+             retrieval_score = 1
+             
         # Normalize: if negative, map it cleanly using sigmoid or logistic function to 0-1, or just max(0, min(1, score)) for simple scaling if it was normalized
         # Since FAISS/Cross-Encoder scores can be negative logits (-10 to 10 typical):
-        normalized_confidence = 1 / (1 + math.exp(-raw_score)) if raw_score < 0 or raw_score > 1 else raw_score
-            
-        confidence_rounded = round(normalized_confidence, 2)
+        normalized_confidence = 1 / (1 + math.exp(-retrieval_score)) if retrieval_score < 0 or retrieval_score > 1 else retrieval_score
+        
+        confidence_score = (0.4 * retrieval_score) + (0.3 * (best_scored[0][0] if best_scored else 0.0)) + (0.2 * 0.5) + (0.1 * 0.5)
+        # Cap confidence score at 1.0 and format to 2 decimal places
+        confidence_rounded = min(round(confidence_score, 2), 1.0)
+        if confidence_rounded < 0.3:
+            simple_answer = f"Answer may not be accurate. {simple_answer}"
 
+        # Confidence label mapping
+        if confidence_rounded * 100 > 80:
+             conf_label = "High"
+        elif confidence_rounded * 100 > 50:
+             conf_label = "Medium"
+        else:
+             conf_label = "Low"
+
+        # Pass it as an string that looks like `1.0 (High)` to fit existing schema or just return confidence
+        
         result_dict = {
             "simple_answer": simple_answer,
             "supporting_text": text,
             "key_entities": key_entities,
-            "confidence": confidence_rounded
+            "confidence": f"{confidence_rounded} ({conf_label})",
+            "source_meta": meta
         }
 
         # We return a JSON string which the frontend (or router) will parse.

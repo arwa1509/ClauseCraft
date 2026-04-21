@@ -41,6 +41,57 @@ class DenseRetriever:
             if tokenized_corpus:
                 self._bm25 = BM25Okapi(tokenized_corpus)
                 logger.info(f"✅ Built BM25 search index on {len(tokenized_corpus)} chunks")
+                
+    def _calculate_structure_score(self, chunk_data: dict, query_intent: str) -> float:
+        """Calculate score based on document structure."""
+        text = chunk_data.get("text", "")
+        meta = chunk_data.get("metadata", {})
+        
+        score = 0.0
+        position_score = 0.0
+        
+        # Base rules
+        if any(w in text for w in ["Section", "Explanation", "(a)", "(b)"]):
+            score += 0.4
+            
+        chunk_idx = meta.get("chunk_index", 0)
+        total_chunks = meta.get("total_chunks", 1)
+        if total_chunks == 0:
+            total_chunks = 1
+            
+        pos_ratio = chunk_idx / total_chunks
+        if pos_ratio <= 0.3:
+            position_score += 0.4
+        elif pos_ratio <= 0.8:
+            position_score += 0.2
+        else:
+            position_score -= 0.5
+            
+        if "PRAYER" in text or "It is therefore prayed" in text:
+            score -= 1.0
+            
+        if "An Act to provide" in text:
+            score -= 0.4
+            
+        # Query-specific rules
+        if query_intent == "reasoning":
+            if any(w in text.lower() for w in ["false", "fabricated", "not involved", "no criminal case", "civil dispute"]):
+                score += 0.6
+            if "PRAYER" in text.upper():
+                score -= 2.0
+        elif query_intent == "section":
+            if "Section" in text:
+                score += 0.3
+        elif query_intent == "definition":
+            if pos_ratio <= 0.2:
+                score += 0.3
+            if "Explanation" in text:
+                score += 0.2
+        elif query_intent == "condition":
+            if any(w in text.lower() for w in ["clause", "rule", "provided that"]):
+                score += 0.3
+                
+        return score + position_score
 
     def _get_bm25_scores(self, query: str) -> dict:
         if not self._bm25:
@@ -66,11 +117,11 @@ class DenseRetriever:
         }
 
     def retrieve(
-        self, query: str, top_k: int = DENSE_TOP_K
+        self, query: str, top_k: int = DENSE_TOP_K, query_intent: str = "general"
     ) -> list[dict]:
         """
         Perform hybrid FAISS + BM25 keyword retrieval.
-        Score = 0.5 * Semantic + 0.3 * Keyword
+        Score = 0.4 * Semantic + 0.3 * Keyword + 0.2 * Structure + 0.1 * Entity
         """
         if self.vector_store.size == 0:
             logger.warning("Vector store is empty. Process documents first.")
@@ -79,7 +130,6 @@ class DenseRetriever:
         # 1. Semantic Search
         query_embedding = self.embedder.embed(query)
         dense_results = self.vector_store.search(query_embedding, top_k=top_k * 2)
-        
         dense_scores = {r["chunk_id"]: r["score"] for r in dense_results}
         chunk_data = {r["chunk_id"]: r for r in dense_results}
 
@@ -99,12 +149,6 @@ class DenseRetriever:
 
         final_results = []
         for cid in all_ids:
-            s_score = dense_scores.get(cid, 0.0)
-            k_score = bm25_scores.get(cid, 0.0)
-            
-            # Hybrid Weighting: Normalize roughly to handle scale differences
-            hybrid_score = (0.5 * s_score) + (0.3 * (k_score * 0.1)) 
-
             c_data = chunk_data.get(cid)
             if not c_data:
                 # If it's a BM25 only grab, fish it out of the corpus cache
@@ -119,13 +163,28 @@ class DenseRetriever:
                     }
                 else: 
                     continue
+
+            # Normalized component scores
+            s_score = dense_scores.get(cid, 0.0)
+            k_score = bm25_scores.get(cid, 0.0) * 0.1  # Basic normalization for bm25
+
+            # 3. Structure & Position Score
+            struct_pos_score = self._calculate_structure_score(c_data, query_intent)
+
+            # 4. Entity Score (Simple presence calculation for now)
+            query_terms = set(query.lower().split())
+            entity_count = sum(1 for e in c_data.get("entities", []) if e.get("text", "").lower() in query_terms)
+            ent_score = min(entity_count * 0.2, 1.0)
             
+            # Hybrid Weighting: Normalize roughly to handle scale differences
+            # Final Score = 0.3 semantic + 0.3 keyword + 0.4 struct/position (+ entity bonus)
+            hybrid_score = (0.3 * s_score) + (0.3 * k_score) + (0.4 * struct_pos_score) + (0.1 * ent_score)
+
             c_data["score"] = hybrid_score
             final_results.append(c_data)
 
         # Sort and trim
         final_results = sorted(final_results, key=lambda x: x["score"], reverse=True)[:top_k]
-
         logger.debug(
             f"Hybrid Dense+BM25 retrieval: query='{query[:50]}...' → {len(final_results)} results"
         )

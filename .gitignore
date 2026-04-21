@@ -1,7 +1,18 @@
 # -----------------------
 # 📁 Data folders
 # -----------------------
-data/
+# ignore everything inside data
+data/*
+
+# keep folder structure
+!data/.gitkeep
+!data/documents/
+!data/ner_datasets/
+!data/processed/
+
+# keep empty folders
+data/**/.gitkeep
+
 datasets/
 *.csv
 *.tsv
@@ -17,7 +28,6 @@ datasets/
 *.docx
 *.ppt
 *.pptx
-*.txt
 
 # -----------------------
 # 🧠 Logs & temp

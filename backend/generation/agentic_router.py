@@ -128,6 +128,8 @@ def node_web_search(state: AgentState) -> AgentState:
     the web snippets with any local passages so the LLM gets cross-source context.
     """
     query = state["query"]
+    
+    # We only arrive here if confidence was below threshold (i.e. no relevant document match).
     logger.info(f"[AgentWeb] Triggering Tavily web search for: {query!r}")
 
     web_results: list[dict] = []
@@ -167,6 +169,12 @@ def node_web_search(state: AgentState) -> AgentState:
     # Merge: web results first (fresher), then local passages as fallback
     local_passages = state.get("passages", [])
     merged = web_results + local_passages
+
+    # Since we are fetching from Web, let's flag the system to not strictly filter 
+    # it out downstream as 'not in context'. We assign intent='external_definition' 
+    # to help the generator.
+    if web_results:
+         state["intent"] = "external_web"
 
     return {**state, "web_results": web_results, "final_context": merged}
 

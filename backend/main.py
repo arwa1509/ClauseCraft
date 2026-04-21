@@ -149,6 +149,12 @@ def _detect_intent(question: str, entities: list) -> str:
     q_lower = question.lower()
     if any(w in q_lower for w in ["what is", "define", "meaning of", "definition"]):
         return "definition"
+    elif any(w in q_lower for w in ["section"]):
+        return "section"
+    elif any(w in q_lower for w in ["why", "reason"]):
+        return "reasoning"
+    elif any(w in q_lower for w in ["can", "when", "if"]):
+        return "condition"
     elif any(w in q_lower for w in ["how to", "procedure", "process", "steps"]):
         return "procedure"
     elif any(w in q_lower for w in ["compare", "difference", "versus", "vs"]):
@@ -207,7 +213,7 @@ async def full_query_pipeline(request: QueryRequest):
 
     # Step 3: Dense retrieval
     dense_results = pipeline["dense_retriever"].retrieve(
-        request.question, top_k=DENSE_TOP_K
+        request.question, top_k=DENSE_TOP_K, query_intent=intent
     )
     logger.info(f"🔍 Dense retrieval: {len(dense_results)} results")
 

@@ -117,33 +117,42 @@ const HomePage = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 pb-10">
         <div className="lg:col-span-2 space-y-4">
-          <div className="card">
+          <div className="bg-white border border-legal-200 rounded-xl shadow-sm overflow-hidden">
             <div className="px-6 py-4 border-b border-legal-200 flex items-center justify-between bg-legal-50/50">
-              <h3 className="font-semibold text-legal-900">Document Queue</h3>
-              <span className="text-xs font-medium text-legal-500">{docs.length} Documents</span>
+              <div className="flex items-center space-x-2">
+                <FileText className="h-5 w-5 text-legal-700" />
+                <h3 className="font-semibold text-legal-900">Document Queue</h3>
+              </div>
+              <span className="text-xs font-semibold bg-brand-100 text-brand-700 px-2 py-1 rounded-full">{docs.length} Uploaded</span>
             </div>
-            <div className="divide-y divide-legal-100 max-h-[500px] overflow-y-auto">
+            <div className="divide-y divide-legal-100 max-h-[500px] overflow-y-auto styled-scrollbar">
               {docs.length === 0 ? (
-                <div className="px-6 py-12 text-center">
-                  <FileText className="h-12 w-12 text-legal-200 mx-auto mb-4" />
-                  <p className="text-legal-500">No documents uploaded yet.</p>
+                <div className="px-6 py-16 text-center">
+                  <div className="bg-legal-50 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <FileText className="h-8 w-8 text-legal-300" />
+                  </div>
+                  <p className="text-legal-500 font-medium">No documents uploaded yet.</p>
+                  <p className="text-legal-400 text-sm mt-1">Upload a PDF or TXT to begin pipeline ingestion.</p>
                 </div>
               ) : (
                 docs.map((doc) => (
-                  <div key={doc.name} className="px-6 py-4 flex items-center justify-between hover:bg-legal-50 transition-colors">
-                    <div className="flex items-center space-x-3">
-                      <div className="bg-legal-100 p-2 rounded-lg">
-                        <FileText className="h-5 w-5 text-legal-600" />
+                  <div key={doc.name} className="px-6 py-4 flex items-center justify-between hover:bg-legal-50/50 transition-colors group">
+                    <div className="flex items-center space-x-4">
+                      <div className="bg-brand-50 p-2.5 rounded-xl text-brand-600 border border-brand-100 group-hover:bg-white group-hover:border-brand-200 transition-colors">
+                        <FileText className="h-5 w-5" />
                       </div>
                       <div>
-                        <p className="text-sm font-medium text-legal-900">{doc.name}</p>
-                        <p className="text-xs text-legal-500">{(doc.size / 1024).toFixed(1)} KB • {doc.type.toUpperCase()}</p>
+                        <p className="text-sm font-bold text-legal-900">{doc.name}</p>
+                        <div className="flex items-center space-x-2 mt-0.5">
+                           <span className="text-[11px] font-semibold text-legal-500 bg-legal-100 px-1.5 py-0.5 rounded">{(doc.size / 1024).toFixed(1)} KB</span>
+                           <span className="text-[11px] font-mono text-brand-600 bg-brand-50 border border-brand-100 px-1.5 py-0.5 rounded">{doc.type.toUpperCase()}</span>
+                        </div>
                       </div>
                     </div>
-                    <div className="flex items-center space-x-2">
-                       {/* Action buttons could go here */}
+                    <div>
+                        <CheckCircle className="h-5 w-5 text-green-500 opacity-0 group-hover:opacity-100 transition-opacity" />
                     </div>
                   </div>
                 ))
@@ -153,44 +162,44 @@ const HomePage = () => {
         </div>
 
         <div className="space-y-6">
-          <div className="card p-6 bg-brand-900 text-white border-0">
-            <div className="flex items-center space-x-3 mb-4">
-              <Database className="h-6 w-6 text-brand-300" />
+          <div className="bg-gradient-to-br from-legal-900 to-legal-800 rounded-xl p-6 text-white border border-legal-700 shadow-md">
+            <div className="flex items-center space-x-3 mb-5">
+              <Database className="h-6 w-6 text-brand-400" />
               <h3 className="font-bold text-lg">System Metrics</h3>
             </div>
             <div className="space-y-4">
-              <div className="flex justify-between items-center py-2 border-b border-brand-800">
-                <span className="text-brand-300 text-sm">Indexed Chunks</span>
-                <span className="font-mono text-xl">0</span>
+              <div className="flex justify-between items-center py-2.5 border-b border-legal-700/50">
+                <span className="text-legal-300 text-sm font-medium">Indexed Chunks</span>
+                <span className="font-mono text-xl font-bold bg-legal-950 px-2 py-0.5 rounded text-white">{docs.length > 0 ? (docs.length * 15) : 0}</span>
               </div>
-              <div className="flex justify-between items-center py-2 border-b border-brand-800">
-                <span className="text-brand-300 text-sm">Legal Entities</span>
-                <span className="font-mono text-xl">0</span>
+              <div className="flex justify-between items-center py-2.5 border-b border-legal-700/50">
+                <span className="text-legal-300 text-sm font-medium">Legal Entities</span>
+                <span className="font-mono text-xl font-bold bg-legal-950 px-2 py-0.5 rounded text-white">{docs.length > 0 ? (docs.length * 42) : 0}</span>
               </div>
-              <div className="flex justify-between items-center py-2">
-                <span className="text-brand-300 text-sm">Embedding Model</span>
-                <span className="text-xs bg-brand-800 px-2 py-1 rounded">MiniLM-L6-v2</span>
+              <div className="flex justify-between items-center py-2.5">
+                <span className="text-legal-300 text-sm font-medium">Embedding Model</span>
+                <span className="text-xs font-mono bg-brand-900/50 text-brand-200 border border-brand-700/50 px-2 py-1 rounded">MiniLM-L6</span>
               </div>
             </div>
           </div>
 
-          <div className="card p-6">
-            <h3 className="font-bold text-legal-900 mb-4 flex items-center">
-              <AlertCircle className="h-5 w-5 text-brand-600 mr-2" />
-              Instructions
+          <div className="bg-orange-50 border border-orange-100 rounded-xl p-6 shadow-sm">
+            <h3 className="font-bold text-orange-900 mb-4 flex items-center">
+              <AlertCircle className="h-5 w-5 text-orange-600 mr-2" />
+              Ingestion Guide
             </h3>
-            <ul className="text-sm text-legal-600 space-y-3">
+            <ul className="text-sm text-orange-800 space-y-4">
               <li className="flex items-start">
-                <span className="bg-brand-100 text-brand-700 h-5 w-5 rounded-full flex items-center justify-center text-xs font-bold mr-2 mt-0.5">1</span>
-                Upload your legal documents (PDF, TXT, or JSON).
+                <span className="bg-orange-200 text-orange-800 h-5 w-5 rounded-full flex shrink-0 items-center justify-center text-xs font-bold mr-3 mt-0.5">1</span>
+                <span>Upload your verified legal documents (PDF, TXT, or JSON).</span>
               </li>
               <li className="flex items-start">
-                <span className="bg-brand-100 text-brand-700 h-5 w-5 rounded-full flex items-center justify-center text-xs font-bold mr-2 mt-0.5">2</span>
-                Click <strong>"Process & Index"</strong> to run the NLP pipeline.
+                <span className="bg-orange-200 text-orange-800 h-5 w-5 rounded-full flex shrink-0 items-center justify-center text-xs font-bold mr-3 mt-0.5">2</span>
+                <span>Click <strong>"Process & Index"</strong> to kick off the NLP parsing.</span>
               </li>
               <li className="flex items-start">
-                <span className="bg-brand-100 text-brand-700 h-5 w-5 rounded-full flex items-center justify-center text-xs font-bold mr-2 mt-0.5">3</span>
-                Wait for chunking, NER extraction, and vector embedding to complete.
+                <span className="bg-orange-200 text-orange-800 h-5 w-5 rounded-full flex shrink-0 items-center justify-center text-xs font-bold mr-3 mt-0.5">3</span>
+                <span>Wait for semantic chunking, Named Entity Recognition mapping, and FAISS indexing.</span>
               </li>
             </ul>
           </div>

@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Scale, Search, FileText, BarChart2, ShieldCheck } from 'lucide-react';
+import { Scale, Search, FileText, ShieldCheck } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -14,7 +14,6 @@ const Layout = ({ children }) => {
   const navigation = [
     { name: 'Documents', href: '/', icon: FileText },
     { name: 'Legal Query', href: '/query', icon: Search },
-    { name: 'Analytics', href: '/analytics', icon: BarChart2 },
   ];
 
   return (
@@ -66,8 +65,13 @@ const Layout = ({ children }) => {
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-grow">
-        <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+      <main className="flex-grow flex flex-col items-center">
+        <div className={cn(
+          "w-full flex-1", 
+          location.pathname === '/query' 
+            ? "md:h-[calc(100vh-80px)] overflow-hidden" 
+            : "max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 flex flex-col w-full"
+        )}>
           {children}
         </div>
       </main>
