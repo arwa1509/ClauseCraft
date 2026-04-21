@@ -88,6 +88,7 @@ from retrieval.entity_retrieval import EntityRetriever
 from retrieval.fusion import reciprocal_rank_fusion
 from ranking.cross_encoder import CrossEncoderReranker
 from generation.rag_generator import RAGGenerator
+from generation.agentic_router import AgenticRouter
 from explainability.claim_mapper import ClaimMapper
 from explainability.confidence import ConfidenceScorer
 from explainability.highlighter import EntityHighlighter
@@ -133,7 +134,7 @@ def _get_pipeline():
             _pipeline_components["entity_index"]
         )
         _pipeline_components["reranker"] = CrossEncoderReranker()
-        _pipeline_components["generator"] = RAGGenerator()
+        _pipeline_components["generator"] = AgenticRouter()
         _pipeline_components["claim_mapper"] = ClaimMapper(
             _pipeline_components["embedder"]
         )
@@ -238,7 +239,7 @@ async def full_query_pipeline(request: QueryRequest):
 
     # Step 7: RAG Generation
     if reranked:
-        answer = pipeline["generator"].generate(
+        answer = pipeline["generator"].run(
             query=request.question,
             passages=reranked,
             intent=intent,
