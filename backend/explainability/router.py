@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 class ExplainRequest(BaseModel):
-    answer: str
+    answer: dict | str
     source_passages: list[dict]
     query_entities: Optional[list[dict]] = []
 

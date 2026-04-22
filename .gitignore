@@ -67,4 +67,6 @@ __pycache__/
 coverage/
 
 backend/venv/
+.venv/
+backend/.venv/
 venv/

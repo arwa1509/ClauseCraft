@@ -1,343 +1,472 @@
 """
-RAG Generator
-==============
-Generates answers using an LLM with retrieved context passages.
-Supports OpenAI, Ollama, and HuggingFace backends.
+Grounded answer generator for legal retrieval results.
+
+Sentences are scored using a blend of semantic similarity (bi-encoder
+embeddings) and lexical overlap, so the generator understands meaning
+rather than relying on exact term matches.
 """
 
+from __future__ import annotations
+
+import re
 from typing import Optional
-import json
-import nltk
+
+import numpy as np
 from loguru import logger
-import math
 
-# Download punkt tokenizer on first run if needed
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
-
-from config import (
-    LLM_PROVIDER, OPENAI_API_KEY, OPENAI_MODEL,
-    OLLAMA_BASE_URL, OLLAMA_MODEL, HF_MODEL_NAME,
-)
-from generation.prompt_templates import get_system_prompt, get_qa_prompt
+from sentence_utils import split_sentences
 
 
 class RAGGenerator:
     """
-    LLM-based answer generator with strict grounding.
-    Supports multiple backends: OpenAI, Ollama, HuggingFace.
+    Build grounded answers from retrieved passages.
+
+    When an embedder is supplied, sentence selection is driven primarily by
+    semantic similarity to the query (65%) with lexical overlap as a
+    secondary signal (35%). Without an embedder it falls back to lexical-only.
     """
 
-    def __init__(self, provider: Optional[str] = None):
-        self.provider = "huggingface"
-        self._client = None
-        self._setup_provider()
-
-    def _setup_provider(self):
-        """Initialize the LLM provider."""
-        if self.provider == "openai":
-            self._setup_openai()
-        elif self.provider == "ollama":
-            self._setup_ollama()
-        elif self.provider == "huggingface":
-            self._setup_huggingface()
-        else:
-            logger.warning(f"Unknown LLM provider: {self.provider}, using fallback")
-            self.provider = "fallback"
-
-    def _setup_openai(self):
-        """Setup OpenAI client."""
-        if not OPENAI_API_KEY:
-            logger.warning("OPENAI_API_KEY not set. Generation will use fallback.")
-            self.provider = "fallback"
-            return
-
-        try:
-            from openai import OpenAI
-            self._client = OpenAI(api_key=OPENAI_API_KEY)
-            logger.info(f"✅ OpenAI client initialized (model: {OPENAI_MODEL})")
-        except ImportError:
-            logger.warning("openai package not installed")
-            self.provider = "fallback"
-        except Exception as e:
-            logger.error(f"OpenAI setup failed: {e}")
-            self.provider = "fallback"
-
-    def _setup_ollama(self):
-        """Setup Ollama client."""
-        try:
-            import httpx
-            # Test connection
-            resp = httpx.get(f"{OLLAMA_BASE_URL}/api/version", timeout=5)
-            if resp.status_code == 200:
-                logger.info(f"✅ Ollama connected (model: {OLLAMA_MODEL})")
-            else:
-                raise ConnectionError("Ollama not responding")
-        except Exception as e:
-            logger.warning(f"Ollama not available: {e}. Using fallback.")
-            self.provider = "fallback"
-
-    def _setup_huggingface(self):
-        """Setup HuggingFace model."""
-        try:
-            from transformers import pipeline
-            import torch
-            
-            # Use TinyLlama as a small, fast local model for Mac
-            local_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-            logger.info(f"⏳ Loading local model {local_model}...")
-            
-            self._client = pipeline(
-                "text-generation",
-                model=local_model,
-                device_map="auto",
-                max_new_tokens=256,
-                temperature=0.1,
-            )
-            logger.info(f"✅ HuggingFace model loaded: {local_model}")
-        except Exception as e:
-            logger.warning(f"HuggingFace setup failed: {e}. Using fallback.")
-            self.provider = "fallback"
+    def __init__(self, provider: Optional[str] = None, embedder=None):
+        self.provider = provider or "extractive"
+        self.embedder = embedder
 
     def generate(
         self,
         query: str,
         passages: list[dict],
         intent: str = "general",
-        entities: list[dict] = None,
-        max_tokens: int = 1024,
-        temperature: float = 0.1,
-    ) -> str:
-        """
-        Extract the most relevant sentences from passages instead of using an LLM.
-        Returns a hardcoded JSON string that is parsed by the frontend to provide
-        the 4 sections: Simple Answer, Supporting Text, Key Entities, Confidence.
-        """
+        entities: Optional[list[dict]] = None,
+        max_sentences: int = 5,
+    ) -> dict:
         if not passages:
-            return json.dumps({
-                "simple_answer": "No relevant passages were found in the document corpus to answer this question.",
-                "supporting_text": "",
+            return {
+                "simple_answer": (
+                    "I could not find enough support in the indexed documents to "
+                    "answer this question."
+                ),
+                "markdown_answer": (
+                    "I could not find enough support in the indexed documents to answer "
+                    "this question."
+                ),
+                "answer_text": "",
+                "supporting_passages": [],
                 "key_entities": [],
-                "confidence": 0.0
+                "citations": [],
+                "evidence_points": [],
+                "answer_segments": [],
+                "confidence": 0.0,
+                "answer_type": "insufficient_context",
+            }
+
+        entities = entities or []
+        query_terms = self._query_terms(query, entities)
+
+        # ── Pre-compute query embedding once ──────────────────────────────────
+        query_emb = None
+        if self.embedder is not None:
+            try:
+                query_emb = self.embedder.embed(query)
+            except Exception as exc:
+                logger.warning(f"Query embedding failed, falling back to lexical: {exc}")
+
+        # ── Collect all candidate sentences with position tracking ────────────
+        all_sentence_data: list[dict] = []
+        for passage_rank, passage in enumerate(passages[:5], start=1):
+            text = passage.get("text", "")
+            for sent_idx, sentence in enumerate(self._split_sentences(text)):
+                all_sentence_data.append({
+                    "text": sentence,
+                    "passage": passage,
+                    "passage_rank": passage_rank,
+                    "sent_idx": sent_idx,
+                })
+
+        # ── Batch semantic scoring (one forward pass for all sentences) ────────
+        semantic_scores = [0.0] * len(all_sentence_data)
+        use_semantic = False
+        if query_emb is not None and all_sentence_data:
+            try:
+                sent_texts = [s["text"] for s in all_sentence_data]
+                sent_embs = self.embedder.embed_batch(sent_texts, show_progress=False)
+                raw = np.dot(sent_embs, query_emb)
+                semantic_scores = [float(max(0.0, s)) for s in raw]
+                use_semantic = True
+                logger.debug(
+                    "Semantic sentence scoring: %d sentences, top sim=%.3f",
+                    len(sent_texts),
+                    max(semantic_scores) if semantic_scores else 0.0,
+                )
+            except Exception as exc:
+                logger.warning(f"Batch semantic scoring failed: {exc}")
+
+        # ── Score and filter ───────────────────────────────────────────────────
+        candidate_sentences: list[dict] = []
+        for i, sent_data in enumerate(all_sentence_data):
+            score = self._sentence_score(
+                sent_data["text"],
+                query_terms,
+                intent,
+                semantic_sim=semantic_scores[i],
+                use_semantic=use_semantic,
+            )
+            if score <= 0:
+                continue
+            candidate_sentences.append({
+                **sent_data,
+                "score": round(min(max(score, 0.0), 1.2), 4),
             })
 
-        logger.debug(f"Extracting answer for query: {query}")
-        
-        # Best chunk is the top ranked one
-        best_passage = passages[0]
-        text = best_passage.get("text", "")
-        passage_entities = best_passage.get("entities", [])
-        
-        # Split text into sentences
-        sentences = nltk.sent_tokenize(text)
-        
-        # Simple scoring: Jaccard similarity between query words and sentence words
-        query_words = set(query.lower().split())
-        scored_sentences = []
-        for sent in sentences:
-            sent_words = set(sent.lower().split())
-            if not query_words or not sent_words:
-                score = 0.0
-            else:
-                intersection = len(query_words.intersection(sent_words))
-                union = len(query_words.union(sent_words))
-                score = intersection / union
-                
-            # Sentence intent scoring logic
-            if intent == "reasoning":
-                if any(w in sent.lower() for w in ["false", "because", "reason", "not", "fabricated", "not involved", "civil dispute", "not required", "no criminal case"]):
-                    score += 0.8
-                if any(w in sent.lower() for w in ["prayer", "it is therefore prayed", "pray"]):
-                    score -= 2.0
-            elif intent == "condition":
-                if any(w in sent.lower() for w in ["shall", "if", "may"]):
-                    score += 0.3
-            elif intent == "external_web":
-                 # Slightly boost web results so they show up for out-of-context queries 
-                 if len(sent) > 50:
-                     score += 0.4
+        candidate_sentences.sort(
+            key=lambda item: (
+                item["score"],
+                item["passage"].get("score", 0),
+                -item["passage_rank"],
+            ),
+            reverse=True,
+        )
 
-            scored_sentences.append((score, sent))
-            
-        # Sort and take top 1 to 2 sentences to form simple answer
-        scored_sentences.sort(key=lambda x: x[0], reverse=True)
-        
-        # Select best 2 sentences (if available) and maintain their original order
-        best_scored = [item for item in scored_sentences[:3] if item[0] > 0]
+        selected = self._select_diverse_sentences(candidate_sentences, max_sentences)
+        best_passages = self._select_supporting_passages(passages)
 
-        # Properly formulate the extracted sentences so it reads coherently rather than fragments.
-        if len(best_scored) > 0:
-            best_sents = [s for _, s in best_scored]
-            ordered_best = [s for s in sentences if s in best_sents]
-            extracted_core = " ".join(ordered_best)
-            
-            # Clean output (e.g., remove numberings, simplify)
-            import re
-            extracted_core = re.sub(r'^\d+\.\s*', '', extracted_core)
-            extracted_core = re.sub(r'\(\w\)', '', extracted_core)
-            
-            simple_answer = f"Based on the provided context, {extracted_core[0].lower()}{extracted_core[1:]}"
-            if not simple_answer.endswith('.'): 
-                simple_answer += "."
-        else:
-            simple_answer = "This query does not appear to be within the context of the provided legal documents or law."
-            
-        # Grab source metadata
-        meta = best_passage.get("metadata", {})
-        
-        # Grab key entities from the passage to display
-        key_entities = list(set([e.get("text", "") + f" ({e.get('label', '')})" for e in passage_entities if isinstance(e, dict)]))
-        
-        # Calculate a normalized confidence score [0, 1.0] from arbitrary retrieval scores
-        retrieval_score = best_passage.get("score", 0.0)
-        # Normalized logic for 0-1, handle <0 and >1 gracefully
-        if retrieval_score < 0:
-             retrieval_score = 0
-        if retrieval_score > 1:
-             retrieval_score = 1
-             
-        # Normalize: if negative, map it cleanly using sigmoid or logistic function to 0-1, or just max(0, min(1, score)) for simple scaling if it was normalized
-        # Since FAISS/Cross-Encoder scores can be negative logits (-10 to 10 typical):
-        normalized_confidence = 1 / (1 + math.exp(-retrieval_score)) if retrieval_score < 0 or retrieval_score > 1 else retrieval_score
-        
-        confidence_score = (0.4 * retrieval_score) + (0.3 * (best_scored[0][0] if best_scored else 0.0)) + (0.2 * 0.5) + (0.1 * 0.5)
-        # Cap confidence score at 1.0 and format to 2 decimal places
-        confidence_rounded = min(round(confidence_score, 2), 1.0)
-        if confidence_rounded < 0.3:
-            simple_answer = f"Answer may not be accurate. {simple_answer}"
-
-        # Confidence label mapping
-        if confidence_rounded * 100 > 80:
-             conf_label = "High"
-        elif confidence_rounded * 100 > 50:
-             conf_label = "Medium"
-        else:
-             conf_label = "Low"
-
-        # Pass it as an string that looks like `1.0 (High)` to fit existing schema or just return confidence
-        
-        result_dict = {
-            "simple_answer": simple_answer,
-            "supporting_text": text,
-            "key_entities": key_entities,
-            "confidence": f"{confidence_rounded} ({conf_label})",
-            "source_meta": meta
-        }
-
-        # We return a JSON string which the frontend (or router) will parse.
-        return json.dumps(result_dict)
-
-    def _generate_openai(
-        self, system: str, user: str, max_tokens: int, temperature: float
-    ) -> str:
-        """Generate using OpenAI API."""
-        try:
-            response = self._client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
+        if not selected:
+            best_passage = passages[0]
+            fallback_text = self._clean_sentence(best_passage.get("text", ""))[:350]
+            if fallback_text and not fallback_text.endswith("."):
+                fallback_text += "."
+            confidence = min(max(best_passage.get("score", 0.0), 0.0), 1.0)
+            return {
+                "simple_answer": (
+                    "The top retrieved passage may be relevant, but I do not have "
+                    "enough sentence-level support to answer confidently."
+                ),
+                "markdown_answer": (
+                    "The top retrieved passage may be relevant, but I do not have enough "
+                    "sentence-level support to answer confidently.\n\n"
+                    "## Best Available Passage\n"
+                    f"> {fallback_text}"
+                ),
+                "answer_text": fallback_text,
+                "supporting_passages": best_passages,
+                "key_entities": self._collect_entities(passages[:2]),
+                "citations": self._citations_from_passages(best_passages),
+                "evidence_points": [
+                    {
+                        "text": fallback_text,
+                        "citation_ids": [1] if best_passages else [],
+                        "chunk_id": best_passage.get("chunk_id", ""),
+                    }
                 ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=0.95,
+                "answer_segments": [],
+                "confidence": round(confidence, 4),
+                "answer_type": "weak_support",
+            }
+
+        ordered_sentences = self._restore_original_order(selected)
+        answer_text = " ".join(item["text"] for item in ordered_sentences).strip()
+        simple_answer = self._format_simple_answer(answer_text)
+
+        cited_passages: list[dict] = []
+        seen_ids: set[str] = set()
+        for item in ordered_sentences:
+            chunk_id = item["passage"].get("chunk_id", "")
+            if chunk_id and chunk_id not in seen_ids:
+                seen_ids.add(chunk_id)
+                cited_passages.append(item["passage"])
+        if not cited_passages:
+            cited_passages = passages[:1]
+
+        citations = self._citations_from_passages(cited_passages)
+        citation_ids_by_chunk = {
+            citation["chunk_id"]: citation["id"] for citation in citations if citation.get("chunk_id")
+        }
+        answer_segments = self._build_answer_segments(ordered_sentences, citation_ids_by_chunk)
+        evidence_points = self._build_evidence_points(ordered_sentences, citation_ids_by_chunk)
+        markdown_answer = self._build_markdown_answer(
+            query=query,
+            answer_text=answer_text,
+            answer_segments=answer_segments,
+            evidence_points=evidence_points,
+            citations=citations,
+        )
+        confidence = self._estimate_confidence(ordered_sentences, cited_passages)
+
+        result = {
+            "simple_answer": simple_answer,
+            "markdown_answer": markdown_answer,
+            "answer_text": answer_text,
+            "supporting_passages": self._select_supporting_passages(cited_passages),
+            "key_entities": self._collect_entities(cited_passages),
+            "citations": citations,
+            "evidence_points": evidence_points,
+            "answer_segments": answer_segments,
+            "confidence": confidence,
+            "answer_type": "grounded_extractive",
+        }
+        logger.debug(
+            "Generated grounded answer: %d citation(s), confidence=%.3f, semantic=%s",
+            len(result["citations"]),
+            result["confidence"],
+            use_semantic,
+        )
+        return result
+
+    # ── Scoring helpers ────────────────────────────────────────────────────────
+
+    def _sentence_score(
+        self,
+        sentence: str,
+        query_terms: set[str],
+        intent: str,
+        semantic_sim: float = 0.0,
+        use_semantic: bool = False,
+    ) -> float:
+        sent_terms = set(re.findall(r"[A-Za-z0-9][A-Za-z0-9\.\-/]*", sentence.lower()))
+        if not sent_terms:
+            return 0.0
+
+        overlap = len(query_terms & sent_terms)
+        coverage = overlap / max(len(query_terms), 1)
+        precision = overlap / max(len(sent_terms), 1)
+        lexical = (0.7 * coverage) + (0.3 * precision)
+
+        if use_semantic:
+            score = 0.35 * lexical + 0.65 * semantic_sim
+        else:
+            score = lexical
+
+        sentence_lower = sentence.lower()
+        if intent == "definition" and any(
+            m in sentence_lower for m in {"means", "refers to", "defined as"}
+        ):
+            score += 0.12
+        if intent == "section" and "section" in sentence_lower:
+            score += 0.12
+        if intent == "condition" and any(
+            m in sentence_lower for m in {"if", "provided that", "subject to", "shall"}
+        ):
+            score += 0.12
+        if intent == "reasoning" and any(
+            m in sentence_lower for m in {"because", "therefore", "since", "held"}
+        ):
+            score += 0.12
+
+        if len(sentence) < 25:
+            score -= 0.1
+        if len(sentence) > 400:
+            score -= 0.08
+        if sentence_lower.startswith("prayer") or "it is therefore prayed" in sentence_lower:
+            score -= 0.4
+
+        return round(min(max(score, 0.0), 1.2), 4)
+
+    def _query_terms(self, query: str, entities: list[dict]) -> set[str]:
+        stop_words = {
+            "a", "an", "and", "are", "be", "by", "can", "does", "for", "how",
+            "if", "in", "is", "it", "of", "on", "or", "the", "to", "what",
+            "when", "which", "who", "why",
+        }
+        tokens = set(re.findall(r"[A-Za-z0-9][A-Za-z0-9\.\-/]*", query.lower()))
+        tokens -= stop_words
+        for entity in entities:
+            entity_text = entity.get("text", "").lower()
+            tokens.update(
+                t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9\.\-/]*", entity_text)
+                if t not in stop_words
             )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"OpenAI generation failed: {e}")
-            return self._generate_fallback_from_prompt(user)
+        return tokens
 
-    def _generate_ollama(
-        self, system: str, user: str, max_tokens: int, temperature: float
-    ) -> str:
-        """Generate using Ollama API."""
-        try:
-            import httpx
-            response = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "system": system,
-                    "prompt": user,
-                    "options": {
-                        "num_predict": max_tokens,
-                        "temperature": temperature,
-                    },
-                    "stream": False,
-                },
-                timeout=120,
+    def _split_sentences(self, text: str) -> list[str]:
+        clean = re.sub(r"\s+", " ", text).strip()
+        return [
+            self._clean_sentence(piece)
+            for piece in split_sentences(clean)
+            if self._clean_sentence(piece)
+        ]
+
+    def _clean_sentence(self, sentence: str) -> str:
+        sentence = re.sub(r"^\d+\.\s*", "", sentence.strip())
+        sentence = re.sub(r"\s+", " ", sentence)
+        return sentence.strip(" -")
+
+    def _select_diverse_sentences(
+        self, candidates: list[dict], max_sentences: int
+    ) -> list[dict]:
+        selected: list[dict] = []
+        seen_texts: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate["text"].lower()
+            if normalized in seen_texts:
+                continue
+            if any(self._near_duplicate(normalized, item["text"].lower()) for item in selected):
+                continue
+            selected.append(candidate)
+            seen_texts.add(normalized)
+            if len(selected) >= max_sentences:
+                break
+        return selected
+
+    def _near_duplicate(self, left: str, right: str) -> bool:
+        left_terms = set(left.split())
+        right_terms = set(right.split())
+        if not left_terms or not right_terms:
+            return False
+        return len(left_terms & right_terms) / len(left_terms | right_terms) > 0.8
+
+    def _restore_original_order(self, selected: list[dict]) -> list[dict]:
+        return sorted(selected, key=lambda item: (item["passage_rank"], item["sent_idx"]))
+
+    def _format_simple_answer(self, answer_text: str) -> str:
+        if not answer_text:
+            return "I could not extract a supported answer from the retrieved passages."
+        answer_text = answer_text.strip()
+        if not answer_text.endswith("."):
+            answer_text += "."
+        return answer_text
+
+    def _build_answer_segments(
+        self,
+        ordered_sentences: list[dict],
+        citation_ids_by_chunk: dict[str, int],
+    ) -> list[dict]:
+        segments = []
+        for item in ordered_sentences:
+            chunk_id = item["passage"].get("chunk_id", "")
+            citation_id = citation_ids_by_chunk.get(chunk_id)
+            segments.append(
+                {
+                    "text": item["text"],
+                    "citation_ids": [citation_id] if citation_id else [],
+                    "chunk_id": chunk_id,
+                    "score": round(float(item.get("score", 0.0)), 4),
+                    "page_num": item["passage"].get("metadata", {}).get("page_num"),
+                    "section": item["passage"].get("metadata", {}).get("section"),
+                }
             )
-            result = response.json()
-            return result.get("response", "").strip()
-        except Exception as e:
-            logger.error(f"Ollama generation failed: {e}")
-            return self._generate_fallback_from_prompt(user)
+        return segments
 
-    def _generate_huggingface(
-        self, system: str, user: str, max_tokens: int, temperature: float
-    ) -> str:
-        """Generate using HuggingFace model."""
-        try:
-            prompt = f"{system}\n\n{user}"
-            result = self._client(
-                prompt,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                do_sample=True,
+    def _build_evidence_points(
+        self,
+        ordered_sentences: list[dict],
+        citation_ids_by_chunk: dict[str, int],
+    ) -> list[dict]:
+        evidence_points = []
+        for item in ordered_sentences:
+            chunk_id = item["passage"].get("chunk_id", "")
+            citation_id = citation_ids_by_chunk.get(chunk_id)
+            evidence_points.append(
+                {
+                    "text": item["text"],
+                    "citation_ids": [citation_id] if citation_id else [],
+                    "chunk_id": chunk_id,
+                    "source": item["passage"].get("metadata", {}).get("source", "local"),
+                    "page_num": item["passage"].get("metadata", {}).get("page_num"),
+                    "section": item["passage"].get("metadata", {}).get("section"),
+                }
             )
-            generated = result[0]["generated_text"]
-            # Remove the prompt from the output
-            if generated.startswith(prompt):
-                generated = generated[len(prompt):].strip()
-            return generated
-        except Exception as e:
-            logger.error(f"HuggingFace generation failed: {e}")
-            return self._generate_fallback_from_prompt(user)
+        return evidence_points
 
-    def _generate_fallback(
-        self, query: str, passages: list[dict], intent: str
+    def _build_markdown_answer(
+        self,
+        query: str,
+        answer_text: str,
+        answer_segments: list[dict],
+        evidence_points: list[dict],
+        citations: list[dict],
     ) -> str:
-        """
-        Fallback generation: extractive answer from passages.
-        Used when no LLM is available.
-        """
-        logger.info("Using extractive fallback (no LLM available)")
+        del query
+        if not answer_segments:
+            return answer_text
 
-        answer_parts = []
-        answer_parts.append(f"Based on the retrieved documents, here is the relevant information:\n")
+        summary_lines = []
+        for segment in answer_segments:
+            refs = " ".join(f"[{cid}]" for cid in segment.get("citation_ids", []))
+            summary_lines.append(f"{segment['text']} {refs}".strip())
 
-        for i, passage in enumerate(passages[:3], 1):
-            text = passage.get("text", "")
+        evidence_lines = []
+        for point in evidence_points:
+            refs = " ".join(f"[{cid}]" for cid in point.get("citation_ids", []))
+            location = []
+            if point.get("section"):
+                location.append(str(point["section"]))
+            if point.get("page_num") is not None:
+                location.append(f"p.{point['page_num']}")
+            location_text = f" ({', '.join(location)})" if location else ""
+            evidence_lines.append(f"- {point['text']} {refs}{location_text}".strip())
+
+        citation_lines = []
+        for citation in citations:
+            parts = [f"[{citation['id']}] {citation.get('doc_name', 'Unknown')}"]
+            if citation.get("section"):
+                parts.append(f"section {citation['section']}")
+            if citation.get("page_num") is not None:
+                parts.append(f"page {citation['page_num']}")
+            if citation.get("source"):
+                parts.append(f"source {citation['source']}")
+            citation_lines.append(f"- {', '.join(parts)}")
+
+        return "\n\n".join(
+            [
+                "## Answer",
+                " ".join(summary_lines),
+                "## Evidence",
+                "\n".join(evidence_lines),
+                "## Citations",
+                "\n".join(citation_lines),
+            ]
+        )
+
+    def _select_supporting_passages(self, passages: list[dict]) -> list[dict]:
+        result: list[dict] = []
+        seen: set[str] = set()
+        for passage in passages[:3]:
+            chunk_id = passage.get("chunk_id", "")
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            result.append({
+                "chunk_id": chunk_id,
+                "text": passage.get("text", ""),
+                "metadata": passage.get("metadata", {}),
+                "score": round(float(passage.get("score", 0.0)), 4),
+            })
+        return result
+
+    def _collect_entities(self, passages: list[dict]) -> list[str]:
+        entities: list[str] = []
+        seen: set[str] = set()
+        for passage in passages:
+            for entity in passage.get("entities", []):
+                text = entity.get("text", "").strip()
+                label = entity.get("label", "").strip()
+                if not text:
+                    continue
+                value = f"{text} ({label})" if label else text
+                if value.lower() not in seen:
+                    seen.add(value.lower())
+                    entities.append(value)
+        return entities[:8]
+
+    def _citations_from_passages(self, passages: list[dict]) -> list[dict]:
+        citations = []
+        for idx, passage in enumerate(passages, start=1):
             meta = passage.get("metadata", {})
-            source = meta.get("doc_name", "Unknown")
+            citations.append({
+                "id": idx,
+                "chunk_id": passage.get("chunk_id", ""),
+                "doc_name": meta.get("doc_name", "Unknown"),
+                "page_num": meta.get("page_num"),
+                "section": meta.get("section"),
+                "source": meta.get("source", "local"),
+                "url": meta.get("url"),
+            })
+        return citations
 
-            # Extract most relevant sentences
-            sentences = [s.strip() for s in text.split(".") if s.strip()]
-            # Take first 3-5 sentences
-            relevant = ". ".join(sentences[:5])
-            if relevant and not relevant.endswith("."):
-                relevant += "."
-
-            answer_parts.append(
-                f"**[Passage {i} — {source}]**: {relevant}"
-            )
-
-        answer_parts.append(
-            "\n*Note: This is an extractive answer. Configure an LLM "
-            "(OpenAI/Ollama) for generated answers with better synthesis.*"
+    def _estimate_confidence(self, sentences: list[dict], passages: list[dict]) -> float:
+        if not sentences:
+            return 0.0
+        sentence_score = sum(item["score"] for item in sentences) / len(sentences)
+        passage_score = sum(float(p.get("score", 0.0)) for p in passages) / len(passages)
+        confidence = (0.55 * min(max(sentence_score, 0.0), 1.0)) + (
+            0.45 * min(max(passage_score, 0.0), 1.0)
         )
-
-        return "\n\n".join(answer_parts)
-
-    def _generate_fallback_from_prompt(self, prompt: str) -> str:
-        """Extract an answer from passages within the prompt."""
-        # Try to extract passage content from the prompt
-        lines = prompt.split("\n")
-        passage_lines = [l for l in lines if l.strip() and not l.startswith("---")]
-
-        return (
-            "I was unable to generate a synthesized answer due to LLM connectivity issues. "
-            "Please refer to the source passages below for relevant information."
-        )
+        return round(min(max(confidence, 0.0), 1.0), 4)

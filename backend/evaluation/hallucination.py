@@ -1,73 +1,49 @@
 """
-Hallucination Detection
-========================
-Detects hallucinated content in generated answers using
-Natural Language Inference (NLI) models.
+Hallucination detection using NLI when available.
 """
+
+from __future__ import annotations
 
 import re
 from typing import Optional
+
 from loguru import logger
 
 try:
     from transformers import pipeline as hf_pipeline
+
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
 
 from config import NLI_MODEL
+from sentence_utils import split_sentences
 
 
 class HallucinationDetector:
-    """
-    Detects hallucinations by checking if answer claims
-    are entailed by the source passages using NLI.
-
-    Labels:
-    - ENTAILMENT: claim is supported by evidence
-    - CONTRADICTION: claim contradicts evidence
-    - NEUTRAL: claim is not supported (potential hallucination)
-    """
-
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = model_name or NLI_MODEL
         self.nli_model = None
         self._load_model()
 
     def _load_model(self):
-        """Load the NLI model."""
         if not HF_AVAILABLE:
-            logger.warning("transformers not available, hallucination detection limited")
+            logger.warning("transformers not available; hallucination detection limited")
             return
 
         try:
             self.nli_model = hf_pipeline(
-                "zero-shot-classification",
+                "text-classification",
                 model=self.model_name,
+                return_all_scores=True,
             )
-            logger.info(f"✅ NLI model loaded: {self.model_name}")
-        except Exception as e:
-            logger.warning(f"Failed to load NLI model: {e}")
+            logger.info(f"NLI model loaded: {self.model_name}")
+        except Exception as exc:
+            logger.warning(f"Failed to load NLI model: {exc}")
             self.nli_model = None
 
-    def detect(
-        self,
-        answer: str,
-        source_passages: list[dict],
-    ) -> dict:
-        """
-        Detect hallucinations in the generated answer.
-
-        Args:
-            answer: Generated answer text
-            source_passages: Source passages used for generation
-
-        Returns:
-            Dict with hallucination analysis
-        """
-        # Extract claims from answer
+    def detect(self, answer: str | dict, source_passages: list[dict]) -> dict:
         claims = self._extract_claims(answer)
-
         if not claims:
             return {
                 "hallucination_rate": 0.0,
@@ -75,124 +51,111 @@ class HallucinationDetector:
                 "analysis": "No extractable claims found",
             }
 
-        # Combine source passages into evidence text
-        evidence = " ".join(p.get("text", "") for p in source_passages)
-
+        evidence = " ".join(passage.get("text", "") for passage in source_passages)
         if not evidence.strip():
             return {
                 "hallucination_rate": 1.0,
-                "claims": [{"claim": c, "label": "UNSUPPORTED", "score": 0.0} for c in claims],
+                "claims": [{"claim": claim, "label": "UNSUPPORTED", "score": 0.0} for claim in claims],
                 "analysis": "No source evidence available",
             }
 
-        # Check each claim against evidence
-        results = []
-        for claim in claims:
-            result = self._check_claim(claim, evidence)
-            results.append(result)
-
-        # Compute hallucination rate
+        results = [self._check_claim(claim, evidence) for claim in claims]
         unsupported = sum(
-            1 for r in results if r["label"] in ("NEUTRAL", "CONTRADICTION", "UNSUPPORTED")
+            1 for result in results if result["label"] in {"NEUTRAL", "CONTRADICTION", "UNSUPPORTED"}
         )
-        hallucination_rate = unsupported / len(results) if results else 0
-
+        hallucination_rate = unsupported / len(results) if results else 0.0
         return {
             "hallucination_rate": round(hallucination_rate, 4),
             "total_claims": len(results),
-            "supported": sum(1 for r in results if r["label"] == "ENTAILMENT"),
+            "supported": sum(1 for result in results if result["label"] == "ENTAILMENT"),
             "unsupported": unsupported,
             "claims": results,
         }
 
     def _check_claim(self, claim: str, evidence: str) -> dict:
-        """Check a single claim against the evidence."""
         if self.nli_model:
             return self._check_claim_nli(claim, evidence)
-        else:
-            return self._check_claim_lexical(claim, evidence)
+        return self._check_claim_lexical(claim, evidence)
 
     def _check_claim_nli(self, claim: str, evidence: str) -> dict:
-        """Check claim using NLI model."""
         try:
-            # Truncate evidence to model max length
-            max_evidence_len = 1024
-            if len(evidence) > max_evidence_len:
-                # Find the most relevant part of evidence
-                claim_words = set(claim.lower().split())
-                evidence_sents = evidence.split(".")
-                scored_sents = []
-                for sent in evidence_sents:
-                    overlap = len(set(sent.lower().split()) & claim_words)
-                    scored_sents.append((overlap, sent))
-                scored_sents.sort(reverse=True)
-                evidence = ". ".join(s for _, s in scored_sents[:10])
-
-            result = self.nli_model(
-                evidence,
-                candidate_labels=["entailment", "contradiction", "neutral"],
-                hypothesis=claim,
-            )
-
-            top_label = result["labels"][0].upper()
-            top_score = result["scores"][0]
-
+            evidence = self._trim_evidence_for_claim(claim, evidence)
+            result = self.nli_model({"text": evidence, "text_pair": claim})[0]
+            normalized = self._normalize_nli_scores(result)
+            top_label = max(normalized, key=normalized.get)
+            top_score = normalized[top_label]
             return {
                 "claim": claim,
                 "label": top_label,
                 "score": round(top_score, 4),
-                "all_scores": {
-                    l.upper(): round(s, 4)
-                    for l, s in zip(result["labels"], result["scores"])
-                },
+                "all_scores": {label: round(score, 4) for label, score in normalized.items()},
             }
-        except Exception as e:
-            logger.warning(f"NLI check failed for claim: {e}")
+        except Exception as exc:
+            logger.warning(f"NLI check failed for claim: {exc}")
             return self._check_claim_lexical(claim, evidence)
 
+    def _normalize_nli_scores(self, scores: list[dict]) -> dict[str, float]:
+        label_map = {}
+        for item in scores:
+            label = item.get("label", "").upper()
+            score = float(item.get("score", 0.0))
+            if "ENTAIL" in label:
+                label_map["ENTAILMENT"] = score
+            elif "CONTRAD" in label:
+                label_map["CONTRADICTION"] = score
+            elif "NEUTRAL" in label:
+                label_map["NEUTRAL"] = score
+            elif label in {"LABEL_0", "LABEL_1", "LABEL_2"}:
+                # Common MNLI label order: contradiction, neutral, entailment
+                mapped = {
+                    "LABEL_0": "CONTRADICTION",
+                    "LABEL_1": "NEUTRAL",
+                    "LABEL_2": "ENTAILMENT",
+                }[label]
+                label_map[mapped] = score
+        return label_map or {"NEUTRAL": 0.0}
+
+    def _trim_evidence_for_claim(self, claim: str, evidence: str) -> str:
+        claim_words = set(claim.lower().split())
+        scored_sentences = []
+        for sentence in split_sentences(evidence):
+            overlap = len(set(sentence.lower().split()) & claim_words)
+            scored_sentences.append((overlap, sentence))
+        scored_sentences.sort(key=lambda item: item[0], reverse=True)
+        selected = [sentence for _, sentence in scored_sentences[:8]]
+        return " ".join(selected)[:1500]
+
     def _check_claim_lexical(self, claim: str, evidence: str) -> dict:
-        """Fallback: check claim using lexical overlap."""
         claim_words = set(claim.lower().split())
         evidence_words = set(evidence.lower().split())
-
-        # Remove stop words
-        stop_words = {"the", "a", "an", "is", "are", "was", "were", "in", "of",
-                       "to", "for", "and", "or", "not", "with", "that", "this"}
+        stop_words = {"the", "a", "an", "is", "are", "was", "were", "in", "of", "to", "for", "and", "or", "not", "with", "that", "this"}
         claim_words -= stop_words
         evidence_words -= stop_words
-
         if not claim_words:
             return {"claim": claim, "label": "NEUTRAL", "score": 0.5}
 
         overlap = len(claim_words & evidence_words) / len(claim_words)
-
         if overlap >= 0.6:
             label = "ENTAILMENT"
         elif overlap >= 0.3:
             label = "NEUTRAL"
         else:
             label = "UNSUPPORTED"
+        return {"claim": claim, "label": label, "score": round(overlap, 4)}
 
-        return {
-            "claim": claim,
-            "label": label,
-            "score": round(overlap, 4),
-        }
+    def _extract_claims(self, answer: str | dict) -> list[str]:
+        if isinstance(answer, dict):
+            answer = " ".join(
+                part
+                for part in [answer.get("simple_answer", ""), answer.get("answer_text", "")]
+                if part
+            )
 
-    def _extract_claims(self, answer: str) -> list[str]:
-        """Extract verifiable claims from the answer."""
-        # Remove markdown and citations
         clean = re.sub(r"\*\*.*?\*\*", "", answer)
         clean = re.sub(r"\[.*?\]", "", clean)
-
-        # Split into sentences
-        sentences = re.split(r"(?<=[.!?])\s+", clean)
-
-        # Filter
         claims = []
-        for s in sentences:
-            s = s.strip()
-            if len(s) > 20 and not s.startswith("Note"):
-                claims.append(s)
-
+        for sentence in split_sentences(clean):
+            sentence = sentence.strip()
+            if len(sentence) > 20 and not sentence.startswith("Note"):
+                claims.append(sentence)
         return claims

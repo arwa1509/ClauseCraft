@@ -1,22 +1,20 @@
 """
-Structure-Aware Chunker
-========================
-Splits legal documents into semantically meaningful chunks while
-preserving context and metadata. Supports section/clause/paragraph splitting.
+Structure-aware chunking for legal documents.
 """
 
-import re
+from __future__ import annotations
+
 import hashlib
+import re
 from typing import Optional
+
 from loguru import logger
 
-from config import CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_SIZE
+from config import CHUNK_OVERLAP, CHUNK_SIZE, MIN_CHUNK_SIZE
 from ingestion.text_cleaner import TextCleaner
 
 
 class Chunk:
-    """Represents a document chunk with metadata."""
-
     def __init__(
         self,
         text: str,
@@ -27,6 +25,7 @@ class Chunk:
         section_num: Optional[str] = None,
         chunk_index: int = 0,
         total_chunks: int = 0,
+        char_start: Optional[int] = None,
     ):
         self.text = text
         self.chunk_id = chunk_id
@@ -36,6 +35,7 @@ class Chunk:
         self.section_num = section_num
         self.chunk_index = chunk_index
         self.total_chunks = total_chunks
+        self.char_start = char_start
 
     def to_dict(self) -> dict:
         return {
@@ -53,16 +53,6 @@ class Chunk:
 
 
 class StructureAwareChunker:
-    """
-    Chunks legal documents using structure-aware splitting.
-
-    Strategy:
-    1. Try to split by detected sections (Section, Article, Clause)
-    2. Within sections, split by paragraphs
-    3. If paragraphs too large, use sliding window
-    4. Always preserve context with overlap
-    """
-
     def __init__(
         self,
         chunk_size: int = CHUNK_SIZE,
@@ -80,23 +70,10 @@ class StructureAwareChunker:
         doc_name: str,
         pages: Optional[list[dict]] = None,
     ) -> list[Chunk]:
-        """
-        Chunk a document into semantically meaningful pieces.
-
-        Args:
-            text: Full document text
-            doc_name: Name of the source document
-            pages: Optional list of page dicts with page_num and text
-
-        Returns:
-            List of Chunk objects
-        """
         if not text.strip():
             return []
 
-        # Detect sections
         sections = self.cleaner.detect_sections(text)
-
         if sections:
             logger.info(f"  Found {len(sections)} sections, using structure-aware chunking")
             chunks = self._chunk_by_sections(text, doc_name, sections, pages)
@@ -104,12 +81,28 @@ class StructureAwareChunker:
             logger.info("  No sections detected, using paragraph-based chunking")
             chunks = self._chunk_by_paragraphs(text, doc_name, pages)
 
-        # Update total_chunks count
-        for chunk in chunks:
-            chunk.total_chunks = len(chunks)
-
+        self._finalize_chunks(chunks, doc_name, text, pages)
         logger.info(f"  Created {len(chunks)} chunks for {doc_name}")
         return chunks
+
+    def _finalize_chunks(
+        self,
+        chunks: list[Chunk],
+        doc_name: str,
+        full_text: str,
+        pages: Optional[list[dict]],
+    ):
+        total_chunks = len(chunks)
+        for index, chunk in enumerate(chunks):
+            chunk.chunk_index = index
+            chunk.chunk_id = self._make_chunk_id(doc_name, index)
+            chunk.total_chunks = total_chunks
+            if chunk.page_num is None:
+                chunk.page_num = self._find_page_num(
+                    chunk.char_start if chunk.char_start is not None else 0,
+                    full_text,
+                    pages,
+                )
 
     def _chunk_by_sections(
         self,
@@ -118,63 +111,57 @@ class StructureAwareChunker:
         sections: list[dict],
         pages: Optional[list[dict]] = None,
     ) -> list[Chunk]:
-        """Split text by detected section boundaries."""
         chunks = []
-        chunk_idx = 0
+
+        if sections and sections[0]["start"] > 0:
+            preamble = text[: sections[0]["start"]].strip()
+            if len(preamble) >= self.min_chunk_size:
+                chunks.extend(
+                    self._split_large_text(
+                        preamble,
+                        doc_name,
+                        0,
+                        section_type="PREAMBLE",
+                        section_num="0",
+                        base_offset=0,
+                        pages=pages,
+                        full_text=text,
+                    )
+                )
 
         for i, section in enumerate(sections):
-            # Get section text (from this section start to next section start)
             start = section["start"]
             end = sections[i + 1]["start"] if i + 1 < len(sections) else len(text)
             section_text = text[start:end].strip()
-
             if not section_text:
                 continue
 
-            # If section is small enough, keep as single chunk
             if len(section_text) <= self.chunk_size:
                 if len(section_text) >= self.min_chunk_size:
-                    page_num = self._find_page_num(start, text, pages)
-                    chunk_id = self._make_chunk_id(doc_name, chunk_idx)
-                    chunks.append(Chunk(
-                        text=section_text,
-                        chunk_id=chunk_id,
-                        doc_name=doc_name,
-                        page_num=page_num,
-                        section=section.get("type"),
-                        section_num=section.get("number"),
-                        chunk_index=chunk_idx,
-                    ))
-                    chunk_idx += 1
+                    chunks.append(
+                        Chunk(
+                            text=section_text,
+                            chunk_id="",
+                            doc_name=doc_name,
+                            page_num=self._find_page_num(start, text, pages),
+                            section=section.get("type"),
+                            section_num=section.get("number"),
+                            char_start=start,
+                        )
+                    )
             else:
-                # Section too large — split by paragraphs within section
-                sub_chunks = self._split_large_text(
-                    section_text, doc_name, chunk_idx,
-                    section_type=section.get("type"),
-                    section_num=section.get("number"),
-                    base_offset=start,
-                    pages=pages,
-                    full_text=text,
+                chunks.extend(
+                    self._split_large_text(
+                        section_text,
+                        doc_name,
+                        0,
+                        section_type=section.get("type"),
+                        section_num=section.get("number"),
+                        base_offset=start,
+                        pages=pages,
+                        full_text=text,
+                    )
                 )
-                chunks.extend(sub_chunks)
-                chunk_idx += len(sub_chunks)
-
-        # Handle text before first section
-        if sections and sections[0]["start"] > 0:
-            preamble = text[:sections[0]["start"]].strip()
-            if len(preamble) >= self.min_chunk_size:
-                pre_chunks = self._split_large_text(
-                    preamble, doc_name, 0,
-                    section_type="PREAMBLE",
-                    section_num="0",
-                    base_offset=0,
-                    pages=pages,
-                    full_text=text,
-                )
-                # Prepend and reindex
-                for i, c in enumerate(chunks):
-                    c.chunk_index = i + len(pre_chunks)
-                chunks = pre_chunks + chunks
 
         return chunks
 
@@ -184,47 +171,45 @@ class StructureAwareChunker:
         doc_name: str,
         pages: Optional[list[dict]] = None,
     ) -> list[Chunk]:
-        """Split text by paragraphs, merging small ones."""
-        # Split into paragraphs
-        paragraphs = re.split(r"\n\s*\n", text)
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-
+        paragraphs = self._extract_paragraphs(text, 0)
         chunks = []
-        current_text = ""
-        chunk_idx = 0
+        current_parts = []
+        current_start = None
 
-        for para in paragraphs:
-            # If adding this paragraph exceeds chunk size, save current and start new
-            if current_text and len(current_text) + len(para) + 2 > self.chunk_size:
-                if len(current_text) >= self.min_chunk_size:
-                    chunk_id = self._make_chunk_id(doc_name, chunk_idx)
-                    page_num = self._find_page_num(
-                        text.find(current_text[:50]), text, pages
+        for para_text, para_start in paragraphs:
+            proposed = "\n\n".join(current_parts + [para_text]) if current_parts else para_text
+            if current_parts and len(proposed) > self.chunk_size:
+                chunk_text = "\n\n".join(current_parts)
+                if len(chunk_text) >= self.min_chunk_size and current_start is not None:
+                    chunks.append(
+                        Chunk(
+                            text=chunk_text,
+                            chunk_id="",
+                            doc_name=doc_name,
+                            page_num=self._find_page_num(current_start, text, pages),
+                            char_start=current_start,
+                        )
                     )
-                    chunks.append(Chunk(
-                        text=current_text,
-                        chunk_id=chunk_id,
-                        doc_name=doc_name,
-                        page_num=page_num,
-                        chunk_index=chunk_idx,
-                    ))
-                    chunk_idx += 1
-
-                # Keep overlap from end of current text
-                overlap_text = current_text[-self.chunk_overlap:] if self.chunk_overlap > 0 else ""
-                current_text = overlap_text + "\n\n" + para if overlap_text else para
+                overlap_text = chunk_text[-self.chunk_overlap :] if self.chunk_overlap > 0 else ""
+                current_parts = [part for part in [overlap_text, para_text] if part]
+                current_start = max(current_start or 0, len(text[:para_start]) - len(overlap_text))
             else:
-                current_text = current_text + "\n\n" + para if current_text else para
+                if current_start is None:
+                    current_start = para_start
+                current_parts.append(para_text)
 
-        # Save last chunk
-        if current_text and len(current_text) >= self.min_chunk_size:
-            chunk_id = self._make_chunk_id(doc_name, chunk_idx)
-            chunks.append(Chunk(
-                text=current_text,
-                chunk_id=chunk_id,
-                doc_name=doc_name,
-                chunk_index=chunk_idx,
-            ))
+        if current_parts and current_start is not None:
+            chunk_text = "\n\n".join(current_parts)
+            if len(chunk_text) >= self.min_chunk_size:
+                chunks.append(
+                    Chunk(
+                        text=chunk_text,
+                        chunk_id="",
+                        doc_name=doc_name,
+                        page_num=self._find_page_num(current_start, text, pages),
+                        char_start=current_start,
+                    )
+                )
 
         return chunks
 
@@ -239,72 +224,86 @@ class StructureAwareChunker:
         pages: Optional[list[dict]] = None,
         full_text: Optional[str] = None,
     ) -> list[Chunk]:
-        """Split large text using sliding window with overlap."""
+        del start_idx
         chunks = []
-        idx = start_idx
+        paragraphs = self._extract_paragraphs(text, base_offset)
+        current_parts = []
+        current_start = None
 
-        # Try paragraph-based first
-        paragraphs = re.split(r"\n\s*\n", text)
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-
-        current = ""
-        for para in paragraphs:
-            if current and len(current) + len(para) + 2 > self.chunk_size:
-                if len(current) >= self.min_chunk_size:
-                    chunk_id = self._make_chunk_id(doc_name, idx)
-                    page_num = self._find_page_num(
-                        base_offset, full_text or text, pages
+        for para_text, para_start in paragraphs:
+            proposed = "\n\n".join(current_parts + [para_text]) if current_parts else para_text
+            if current_parts and len(proposed) > self.chunk_size:
+                chunk_text = "\n\n".join(current_parts)
+                if len(chunk_text) >= self.min_chunk_size and current_start is not None:
+                    chunks.append(
+                        Chunk(
+                            text=chunk_text,
+                            chunk_id="",
+                            doc_name=doc_name,
+                            page_num=self._find_page_num(current_start, full_text or text, pages),
+                            section=section_type,
+                            section_num=section_num,
+                            char_start=current_start,
+                        )
                     )
-                    chunks.append(Chunk(
-                        text=current,
-                        chunk_id=chunk_id,
+                overlap_text = chunk_text[-self.chunk_overlap :] if self.chunk_overlap > 0 else ""
+                current_parts = [part for part in [overlap_text, para_text] if part]
+                current_start = max(base_offset, para_start - len(overlap_text))
+            else:
+                if current_start is None:
+                    current_start = para_start
+                current_parts.append(para_text)
+
+        if current_parts and current_start is not None:
+            chunk_text = "\n\n".join(current_parts)
+            if len(chunk_text) >= self.min_chunk_size:
+                chunks.append(
+                    Chunk(
+                        text=chunk_text,
+                        chunk_id="",
                         doc_name=doc_name,
-                        page_num=page_num,
+                        page_num=self._find_page_num(current_start, full_text or text, pages),
                         section=section_type,
                         section_num=section_num,
-                        chunk_index=idx,
-                    ))
-                    idx += 1
+                        char_start=current_start,
+                    )
+                )
 
-                overlap = current[-self.chunk_overlap:] if self.chunk_overlap > 0 else ""
-                current = overlap + "\n\n" + para if overlap else para
-            else:
-                current = current + "\n\n" + para if current else para
-
-        if current and len(current) >= self.min_chunk_size:
-            chunk_id = self._make_chunk_id(doc_name, idx)
-            chunks.append(Chunk(
-                text=current,
-                chunk_id=chunk_id,
-                doc_name=doc_name,
-                section=section_type,
-                section_num=section_num,
-                chunk_index=idx,
-            ))
-
-        # If no paragraphs found, fall back to character-based sliding window
         if not chunks and len(text) >= self.min_chunk_size:
             pos = 0
             while pos < len(text):
                 end = min(pos + self.chunk_size, len(text))
                 chunk_text = text[pos:end].strip()
                 if len(chunk_text) >= self.min_chunk_size:
-                    chunk_id = self._make_chunk_id(doc_name, idx)
-                    chunks.append(Chunk(
-                        text=chunk_text,
-                        chunk_id=chunk_id,
-                        doc_name=doc_name,
-                        section=section_type,
-                        section_num=section_num,
-                        chunk_index=idx,
-                    ))
-                    idx += 1
-                pos += self.chunk_size - self.chunk_overlap
+                    absolute_start = base_offset + pos
+                    chunks.append(
+                        Chunk(
+                            text=chunk_text,
+                            chunk_id="",
+                            doc_name=doc_name,
+                            page_num=self._find_page_num(
+                                absolute_start,
+                                full_text or text,
+                                pages,
+                            ),
+                            section=section_type,
+                            section_num=section_num,
+                            char_start=absolute_start,
+                        )
+                    )
+                pos += max(1, self.chunk_size - self.chunk_overlap)
 
         return chunks
 
+    def _extract_paragraphs(self, text: str, base_offset: int) -> list[tuple[str, int]]:
+        paragraphs = []
+        for match in re.finditer(r"\S(?:.*?\S)?(?=\n\s*\n|\Z)", text, flags=re.DOTALL):
+            para_text = match.group(0).strip()
+            if para_text:
+                paragraphs.append((para_text, base_offset + match.start()))
+        return paragraphs
+
     def _make_chunk_id(self, doc_name: str, chunk_idx: int) -> str:
-        """Generate a unique chunk ID."""
         raw = f"{doc_name}_{chunk_idx}"
         return hashlib.md5(raw.encode()).hexdigest()[:12]
 
@@ -314,15 +313,14 @@ class StructureAwareChunker:
         full_text: str,
         pages: Optional[list[dict]],
     ) -> Optional[int]:
-        """Estimate page number from character offset."""
+        del full_text
         if not pages or char_offset < 0:
             return None
 
         running_offset = 0
         for page in pages:
-            page_len = len(page.get("text", "")) + 2  # +2 for separator
-            if running_offset + page_len > char_offset:
+            page_len = len(page.get("text", ""))
+            if running_offset + page_len >= char_offset:
                 return page.get("page_num")
-            running_offset += page_len
-
+            running_offset += page_len + 2
         return pages[-1].get("page_num") if pages else None

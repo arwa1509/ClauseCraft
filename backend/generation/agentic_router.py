@@ -1,294 +1,224 @@
 """
-Agentic Fallback Engine (LangGraph)
-=====================================
-A stateful agentic router that evaluates retrieval confidence and
-automatically falls back to a Tavily web-search tool when confidence
-drops below the configured threshold (default: 0.75).
+Agentic routing for grounded answer generation.
 
-Graph States:
-    EVALUATE  → run confidence check on retrieved passages
-    LOCAL     → answer from local FAISS index (high confidence path)
-    WEB_SEARCH → query Tavily for supplemental case-law (low confidence path)
-    GENERATE  → call RAGGenerator with the best context
+The system remains corpus-grounded by default. Optional web fallback is
+available only when explicitly enabled by configuration.
+
+Each AgenticRouter instance compiles its own LangGraph with the embedder
+baked in via closure, so RAGGenerator gets semantic scoring on every call.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Optional, TypedDict
 
 from loguru import logger
+from dotenv import load_dotenv
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LangGraph imports
-# ──────────────────────────────────────────────────────────────────────────────
 try:
-    from langgraph.graph import StateGraph, END
+    from langgraph.graph import END, StateGraph
+
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
-    logger.warning("langgraph not installed – AgenticRouter will run in degraded mode.")
+    logger.warning("langgraph not installed; agentic routing will run in degraded mode.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tavily web-search tool
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     from tavily import TavilyClient
+
     TAVILY_AVAILABLE = True
 except ImportError:
     TavilyClient = None
     TAVILY_AVAILABLE = False
-    logger.warning("tavily-python not installed – web-search fallback disabled.")
+    logger.warning("tavily-python not installed; web fallback is unavailable.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Internal imports
-# ──────────────────────────────────────────────────────────────────────────────
 from generation.rag_generator import RAGGenerator
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
-CONFIDENCE_THRESHOLD: float = float(os.getenv("AGENTIC_CONFIDENCE_THRESHOLD", "0.75"))
-TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
-WEB_SEARCH_MAX_RESULTS: int = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+_CASE_INTENTS = frozenset({"case_based", "reasoning", "factual"})
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Graph State Schema
-# ──────────────────────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
-    """Mutable state object passed between LangGraph nodes."""
     query: str
-    passages: list[dict]          # retrieved from local FAISS / entity index
+    passages: list[dict]
     intent: str
     entities: list[dict]
-    confidence: float             # score from confidence.py or rag_generator
-    web_results: list[dict]       # results fetched from Tavily
-    final_context: list[dict]    # merged passages used for generation
-    answer: str                   # final JSON answer string
-    route: str                    # "local" | "web_search"
+    confidence: float
+    web_results: list[dict]
+    final_context: list[dict]
+    answer: dict
+    route: str
     error: Optional[str]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: derive confidence from passages
-# ──────────────────────────────────────────────────────────────────────────────
+def _load_runtime_settings() -> dict[str, Any]:
+    load_dotenv(override=True)
+    return {
+        "confidence_threshold": float(os.getenv("AGENTIC_CONFIDENCE_THRESHOLD", "0.75")),
+        "web_search_max_results": int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5")),
+        "tavily_api_key": os.getenv("TAVILY_API_KEY", "").strip(),
+        "web_fallback_enabled": os.getenv(
+            "AGENTIC_WEB_FALLBACK_ENABLED", "false"
+        ).lower() == "true",
+    }
+
 
 def _derive_confidence(passages: list[dict]) -> float:
-    """
-    Compute a confidence score from the top-ranked passage.
-    Replicates the sigmoid normalization used in rag_generator.py so the
-    agentic layer is consistent with the generation layer.
-    """
-    import math
     if not passages:
         return 0.0
-    raw = passages[0].get("score", 0.0)
-    if isinstance(raw, (int, float)):
-        if raw < 0 or raw > 1:
-            return round(1 / (1 + math.exp(-raw)), 4)
-        return round(float(raw), 4)
-    return 0.0
+    top_passages = passages[:3]
+    weights = [0.6, 0.3, 0.1]
+    score = 0.0
+    total_weight = 0.0
+    for weight, passage in zip(weights, top_passages):
+        score += weight * float(passage.get("score", 0.0))
+        total_weight += weight
+    if total_weight == 0:
+        return 0.0
+    return round(min(max(score / total_weight, 0.0), 1.0), 4)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# LangGraph Node Functions
-# ──────────────────────────────────────────────────────────────────────────────
 
 def node_evaluate_confidence(state: AgentState) -> AgentState:
-    """
-    Node 1 – EVALUATE
-    Compute confidence from the retrieved passages and decide routing.
-    """
-    passages = state.get("passages", [])
-    confidence = _derive_confidence(passages)
-    route = "local" if confidence >= CONFIDENCE_THRESHOLD else "web_search"
-
+    settings = _load_runtime_settings()
+    confidence = _derive_confidence(state.get("passages", []))
+    route = "local"
+    if settings["web_fallback_enabled"] and confidence < settings["confidence_threshold"]:
+        route = "web_search"
     logger.info(
-        f"[AgentEval] confidence={confidence:.3f} threshold={CONFIDENCE_THRESHOLD} "
-        f"→ route={route}"
+        f"[AgentEval] confidence={confidence:.3f} "
+        f"threshold={settings['confidence_threshold']:.3f} route={route}"
     )
     return {**state, "confidence": confidence, "route": route}
 
 
 def node_use_local_context(state: AgentState) -> AgentState:
-    """
-    Node 2 – LOCAL
-    High-confidence path: use local FAISS passages as-is.
-    """
-    logger.info("[AgentLocal] Using local FAISS context.")
     return {**state, "final_context": state.get("passages", []), "web_results": []}
 
 
 def node_web_search(state: AgentState) -> AgentState:
-    """
-    Node 3 – WEB_SEARCH
-    Low-confidence path: query Tavily for up-to-date case law, then merge
-    the web snippets with any local passages so the LLM gets cross-source context.
-    """
+    settings = _load_runtime_settings()
     query = state["query"]
-    
-    # We only arrive here if confidence was below threshold (i.e. no relevant document match).
-    logger.info(f"[AgentWeb] Triggering Tavily web search for: {query!r}")
-
     web_results: list[dict] = []
 
-    if not TAVILY_AVAILABLE:
-        logger.warning("[AgentWeb] Tavily not available – skipping web search.")
-    elif not TAVILY_API_KEY:
-        logger.warning("[AgentWeb] TAVILY_API_KEY not set – skipping web search.")
-    else:
-        try:
-            client = TavilyClient(api_key=TAVILY_API_KEY)
-            response = client.search(
-                query=f"legal case law India: {query}",
-                max_results=WEB_SEARCH_MAX_RESULTS,
-                search_depth="advanced",
-                include_answer=True,
-                include_raw_content=False,
-            )
+    if not settings["web_fallback_enabled"]:
+        return {
+            **state,
+            "web_results": [],
+            "final_context": state.get("passages", []),
+            "error": "web_fallback_disabled",
+        }
 
-            for item in response.get("results", []):
-                web_results.append({
-                    "text": item.get("content", ""),
-                    "score": item.get("score", 0.5),
-                    "metadata": {
-                        "source": "tavily_web",
-                        "url": item.get("url", ""),
-                        "title": item.get("title", ""),
-                        "doc_name": item.get("title", "Web Result"),
-                    },
-                    "entities": [],
-                })
+    if not TAVILY_AVAILABLE or not settings["tavily_api_key"]:
+        logger.warning("[AgentWeb] Web fallback requested but Tavily is unavailable.")
+        return {
+            **state,
+            "web_results": [],
+            "final_context": state.get("passages", []),
+            "error": "tavily_not_configured",
+        }
 
-            logger.info(f"[AgentWeb] Fetched {len(web_results)} web results.")
-        except Exception as exc:
-            logger.error(f"[AgentWeb] Tavily search failed: {exc}")
-
-    # Merge: web results first (fresher), then local passages as fallback
-    local_passages = state.get("passages", [])
-    merged = web_results + local_passages
-
-    # Since we are fetching from Web, let's flag the system to not strictly filter 
-    # it out downstream as 'not in context'. We assign intent='external_definition' 
-    # to help the generator.
-    if web_results:
-         state["intent"] = "external_web"
-
-    return {**state, "web_results": web_results, "final_context": merged}
-
-
-def node_generate_answer(state: AgentState) -> AgentState:
-    """
-    Node 4 – GENERATE
-    Call RAGGenerator with the final_context (either local or web-augmented).
-    """
-    generator = RAGGenerator()
-    answer = generator.generate(
-        query=state["query"],
-        passages=state["final_context"],
-        intent=state.get("intent", "general"),
-        entities=state.get("entities", []),
-    )
-
-    # Patch confidence and source information into the JSON answer
     try:
-        answer_dict = json.loads(answer)
-        answer_dict["confidence"] = state["confidence"]
-        answer_dict["source"] = state["route"]
-        answer_dict["web_augmented"] = bool(state.get("web_results"))
-        answer = json.dumps(answer_dict)
-    except (json.JSONDecodeError, TypeError):
-        pass  # answer stays as-is if it's not valid JSON
+        client = TavilyClient(api_key=settings["tavily_api_key"])
+        suffix = " case law judgment" if state.get("intent") in _CASE_INTENTS else " legal"
+        response = client.search(
+            query=f"{query}{suffix}",
+            max_results=settings["web_search_max_results"],
+            search_depth="advanced",
+            include_answer=False,
+            include_raw_content=False,
+        )
+        for item in response.get("results", []):
+            web_results.append({
+                "chunk_id": item.get("url", ""),
+                "text": item.get("content", ""),
+                "score": min(max(float(item.get("score", 0.5)), 0.0), 1.0),
+                "metadata": {
+                    "doc_name": item.get("title", "Web Result"),
+                    "source": "tavily_web",
+                    "url": item.get("url", ""),
+                    "title": item.get("title", ""),
+                },
+                "entities": [],
+            })
+    except Exception as exc:
+        logger.error(f"[AgentWeb] Tavily search failed: {exc}")
+        return {
+            **state,
+            "web_results": [],
+            "final_context": state.get("passages", []),
+            "error": f"web_search_failed: {exc}",
+        }
 
-    logger.info(
-        f"[AgentGen] Answer generated. source={state['route']} "
-        f"web_results={len(state.get('web_results', []))}"
-    )
-    return {**state, "answer": answer}
+    merged = web_results + state.get("passages", [])
+    return {
+        **state,
+        "web_results": web_results,
+        "final_context": merged,
+        "intent": "external_web" if web_results else state.get("intent", "general"),
+        "error": None if web_results else "web_search_returned_no_results",
+    }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Conditional edge: decide which context path to take
-# ──────────────────────────────────────────────────────────────────────────────
 
 def route_decision(state: AgentState) -> str:
-    """Return the next node name based on the route field."""
     return state.get("route", "local")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Build the LangGraph StateGraph
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _build_graph():
-    """Construct and compile the LangGraph agent graph."""
-    if not LANGGRAPH_AVAILABLE:
-        return None
-
-    graph = StateGraph(AgentState)
-
-    # Register nodes
-    graph.add_node("evaluate", node_evaluate_confidence)
-    graph.add_node("local", node_use_local_context)
-    graph.add_node("web_search", node_web_search)
-    graph.add_node("generate", node_generate_answer)
-
-    # Entry point
-    graph.set_entry_point("evaluate")
-
-    # Conditional routing after evaluation
-    graph.add_conditional_edges(
-        "evaluate",
-        route_decision,
-        {
-            "local": "local",
-            "web_search": "web_search",
-        },
-    )
-
-    # Both context paths converge at generate node
-    graph.add_edge("local", "generate")
-    graph.add_edge("web_search", "generate")
-    graph.add_edge("generate", END)
-
-    return graph.compile()
-
-
-# Module-level compiled graph (lazy init to avoid import-time failures)
-_COMPILED_GRAPH = None
-
-
-def _get_graph():
-    global _COMPILED_GRAPH
-    if _COMPILED_GRAPH is None:
-        _COMPILED_GRAPH = _build_graph()
-    return _COMPILED_GRAPH
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
-
 class AgenticRouter:
     """
-    High-level wrapper around the LangGraph agent.
+    Orchestrates retrieval → generation with an optional web fallback.
 
-    Usage::
-
-        router = AgenticRouter()
-        answer_json = router.run(
-            query="What is the penalty for murder under IPC?",
-            passages=[...],          # from your dual-pipeline retriever
-            intent="penalty_query",
-            entities=[...],
-        )
+    Pass ``embedder`` to enable semantic sentence scoring inside RAGGenerator.
+    The graph is compiled once per instance with the embedder captured in a
+    closure, so no global state is needed.
     """
 
-    def __init__(self, confidence_threshold: float = CONFIDENCE_THRESHOLD):
-        self.confidence_threshold = confidence_threshold
-        self._graph = _get_graph()
+    def __init__(
+        self,
+        confidence_threshold: Optional[float] = None,
+        embedder=None,
+    ):
+        settings = _load_runtime_settings()
+        self.confidence_threshold = (
+            confidence_threshold
+            if confidence_threshold is not None
+            else settings["confidence_threshold"]
+        )
+        self.embedder = embedder
+        self._graph = self._build_graph() if LANGGRAPH_AVAILABLE else None
+
+    def _build_graph(self):
+        embedder = self.embedder  # captured in closure — do not rename
+
+        def node_generate_answer(state: AgentState) -> AgentState:
+            generator = RAGGenerator(embedder=embedder)
+            answer = generator.generate(
+                query=state["query"],
+                passages=state["final_context"],
+                intent=state.get("intent", "general"),
+                entities=state.get("entities", []),
+            )
+            answer["router_confidence"] = state["confidence"]
+            answer["source"] = state["route"]
+            answer["web_augmented"] = bool(state.get("web_results"))
+            answer["web_results_count"] = len(state.get("web_results", []))
+            answer["web_error"] = state.get("error")
+            return {**state, "answer": answer}
+
+        graph = StateGraph(AgentState)
+        graph.add_node("evaluate", node_evaluate_confidence)
+        graph.add_node("local", node_use_local_context)
+        graph.add_node("web_search", node_web_search)
+        graph.add_node("generate", node_generate_answer)
+        graph.set_entry_point("evaluate")
+        graph.add_conditional_edges(
+            "evaluate",
+            route_decision,
+            {"local": "local", "web_search": "web_search"},
+        )
+        graph.add_edge("local", "generate")
+        graph.add_edge("web_search", "generate")
+        graph.add_edge("generate", END)
+        return graph.compile()
 
     def run(
         self,
@@ -296,26 +226,23 @@ class AgenticRouter:
         passages: list[dict],
         intent: str = "general",
         entities: Optional[list[dict]] = None,
-    ) -> str:
-        """
-        Execute the agentic graph and return the answer as a JSON string.
-
-        Falls back to a direct RAGGenerator call if LangGraph is unavailable.
-        """
-        if entities is None:
-            entities = []
+    ) -> dict:
+        entities = entities or []
 
         if self._graph is None:
-            logger.warning(
-                "LangGraph not available – using direct RAGGenerator (no agentic routing)."
-            )
-            generator = RAGGenerator()
-            return generator.generate(
+            generator = RAGGenerator(embedder=self.embedder)
+            answer = generator.generate(
                 query=query,
                 passages=passages,
                 intent=intent,
                 entities=entities,
             )
+            answer["router_confidence"] = _derive_confidence(passages)
+            answer["source"] = "local"
+            answer["web_augmented"] = False
+            answer["web_results_count"] = 0
+            answer["web_error"] = "langgraph_unavailable"
+            return answer
 
         initial_state: AgentState = {
             "query": query,
@@ -325,7 +252,7 @@ class AgenticRouter:
             "confidence": 0.0,
             "web_results": [],
             "final_context": [],
-            "answer": "",
+            "answer": {},
             "route": "local",
             "error": None,
         }
@@ -335,29 +262,34 @@ class AgenticRouter:
             return final_state["answer"]
         except Exception as exc:
             logger.error(f"[AgenticRouter] Graph execution failed: {exc}")
-            # Graceful degradation
-            generator = RAGGenerator()
-            return generator.generate(
+            generator = RAGGenerator(embedder=self.embedder)
+            answer = generator.generate(
                 query=query,
                 passages=passages,
                 intent=intent,
                 entities=entities,
             )
+            answer["router_confidence"] = _derive_confidence(passages)
+            answer["source"] = "local"
+            answer["web_augmented"] = False
+            answer["web_results_count"] = 0
+            answer["web_error"] = f"graph_execution_failed: {exc}"
+            return answer
 
-    def get_route_info(
-        self,
-        query: str,
-        passages: list[dict],
-    ) -> dict[str, Any]:
-        """
-        Introspect what route the agent would select without running generation.
-        Useful for explainability dashboards.
-        """
+    def get_route_info(self, query: str, passages: list[dict]) -> dict[str, Any]:
+        settings = _load_runtime_settings()
         confidence = _derive_confidence(passages)
-        route = "local" if confidence >= self.confidence_threshold else "web_search"
+        route = (
+            "web_search"
+            if settings["web_fallback_enabled"] and confidence < self.confidence_threshold
+            else "local"
+        )
         return {
+            "query": query,
             "confidence": confidence,
             "threshold": self.confidence_threshold,
             "route": route,
             "web_augmented": route == "web_search",
+            "web_fallback_enabled": settings["web_fallback_enabled"],
+            "tavily_configured": bool(settings["tavily_api_key"]),
         }

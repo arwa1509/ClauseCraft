@@ -25,7 +25,7 @@ def _get_hallucination_detector():
 
 
 class HallucinationRequest(BaseModel):
-    answer: str
+    answer: dict | str
     source_passages: list[dict]
 
 

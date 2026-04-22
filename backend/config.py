@@ -45,12 +45,12 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "microsoft/phi-2")
 
 # ─── NLI Model (Hallucination Detection) ──────────────────────────────────────
-NLI_MODEL = os.getenv("NLI_MODEL", "facebook/bart-large-mnli")
+NLI_MODEL = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-base")
 
 # ─── Chunking Parameters ──────────────────────────────────────────────────────
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "128"))
-MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "50"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "150"))
 
 # ─── Retrieval Parameters ─────────────────────────────────────────────────────
 FAISS_INDEX_PATH = PROCESSED_DIR / "faiss_index.bin"

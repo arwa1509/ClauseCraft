@@ -7,6 +7,7 @@ Endpoints for uploading, processing, and managing legal documents.
 import json
 import shutil
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -25,9 +26,17 @@ router = APIRouter()
 pdf_parser = PDFParser()
 text_cleaner = TextCleaner()
 chunker = StructureAwareChunker()
+TRACE_PATH = PROCESSED_DIR / "ingestion_trace.json"
 
 # Processing state
-_processing_status = {"status": "idle", "progress": 0, "message": "", "documents": []}
+_processing_status = {
+    "status": "idle",
+    "progress": 0,
+    "message": "",
+    "documents": [],
+    "current_stage": "idle",
+    "metrics": {},
+}
 
 
 class ProcessingStatus(BaseModel):
@@ -35,6 +44,8 @@ class ProcessingStatus(BaseModel):
     progress: float
     message: str
     documents: list
+    current_stage: str = "idle"
+    metrics: dict = {}
 
 
 def _get_all_chunks() -> list[dict]:
@@ -49,7 +60,185 @@ def _save_all_chunks(chunks: list[dict]):
     METADATA_PATH.write_text(json.dumps(chunks, indent=2, default=str))
 
 
-def _process_document(file_path: Path) -> list[dict]:
+def _load_traces() -> list[dict]:
+    if TRACE_PATH.exists():
+        try:
+            return json.loads(TRACE_PATH.read_text())
+        except Exception as exc:
+            logger.warning(f"Failed to load ingestion traces: {exc}")
+    return []
+
+
+def _save_traces(traces: list[dict]):
+    TRACE_PATH.write_text(json.dumps(traces, indent=2, default=str))
+
+
+def _build_metrics_snapshot() -> dict:
+    chunks = _get_all_chunks()
+    docs = []
+    for ext in ["*.pdf", "*.txt", "*.json"]:
+        docs.extend(DOCUMENTS_DIR.glob(ext))
+
+    doc_type_counts = Counter((doc.suffix.lower() or "unknown") for doc in docs)
+    chunks_by_doc = Counter(chunk.get("metadata", {}).get("doc_name", "Unknown") for chunk in chunks)
+    sections_by_doc = Counter()
+    page_refs = set()
+    max_chunk_length = 0
+    total_chunk_chars = 0
+
+    for chunk in chunks:
+        text = chunk.get("text", "")
+        metadata = chunk.get("metadata", {})
+        total_chunk_chars += len(text)
+        max_chunk_length = max(max_chunk_length, len(text))
+        if metadata.get("section"):
+            sections_by_doc[metadata.get("doc_name", "Unknown")] += 1
+        if metadata.get("page_num") is not None:
+            page_refs.add((metadata.get("doc_name", "Unknown"), metadata.get("page_num")))
+
+    entity_stats = {"total_entities": 0, "total_references": 0, "entities_by_label": {}}
+    entity_path = PROCESSED_DIR / "entity_index.json"
+    if entity_path.exists():
+        try:
+            from ner.entity_index import EntityIndex
+
+            entity_stats = EntityIndex().get_stats()
+        except Exception as exc:
+            logger.warning(f"Failed to load entity stats for metrics snapshot: {exc}")
+
+    per_document = []
+    for doc in sorted(docs, key=lambda item: item.name.lower()):
+        per_document.append(
+            {
+                "name": doc.name,
+                "type": doc.suffix.lower(),
+                "size_bytes": doc.stat().st_size,
+                "chunks": chunks_by_doc.get(doc.name, 0),
+                "sections": sections_by_doc.get(doc.name, 0),
+            }
+        )
+
+    avg_chunk_chars = round(total_chunk_chars / len(chunks), 1) if chunks else 0.0
+    faiss_index = PROCESSED_DIR / "faiss_index.bin"
+    npy_index = PROCESSED_DIR / "faiss_index.bin.npy"
+
+    return {
+        "documents_total": len(docs),
+        "chunks_total": len(chunks),
+        "average_chunk_chars": avg_chunk_chars,
+        "max_chunk_chars": max_chunk_length,
+        "documents_by_type": dict(doc_type_counts),
+        "entity_total": entity_stats.get("total_entities", 0),
+        "entity_references_total": entity_stats.get("total_references", 0),
+        "entities_by_label": entity_stats.get("entities_by_label", {}),
+        "page_citations_total": len(page_refs),
+        "vector_index": {
+            "present": faiss_index.exists() or npy_index.exists(),
+            "chunk_vectors": len(chunks),
+        },
+        "per_document": per_document,
+    }
+
+
+def _preview(text: str, limit: int = 240) -> str:
+    clean = " ".join((text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3].rstrip() + "..."
+
+
+def _build_document_trace(
+    file_path: Path,
+    pages: Optional[list[dict]],
+    raw_text: str,
+    clean_text: str,
+    chunk_dicts: list[dict],
+) -> dict:
+    parser = "text"
+    page_samples = []
+    section_titles = []
+    if pages:
+        parser = pages[0].get("metadata", {}).get("parser", "pdf")
+        for page in pages[:8]:
+            metadata = page.get("metadata", {})
+            page_samples.append(
+                {
+                    "page_num": page.get("page_num"),
+                    "char_count": len(page.get("text", "")),
+                    "has_tables": metadata.get("has_tables", False),
+                    "sections": metadata.get("sections", []),
+                    "preview": _preview(page.get("text", "")),
+                }
+            )
+            section_titles.extend(metadata.get("sections", []))
+
+    chunk_samples = []
+    for chunk in chunk_dicts[:12]:
+        meta = chunk.get("metadata", {})
+        chunk_samples.append(
+            {
+                "chunk_id": chunk.get("chunk_id", ""),
+                "page_num": meta.get("page_num"),
+                "section": meta.get("section"),
+                "section_num": meta.get("section_num"),
+                "char_count": len(chunk.get("text", "")),
+                "preview": _preview(chunk.get("text", "")),
+            }
+        )
+
+    return {
+        "document_name": file_path.name,
+        "document_type": file_path.suffix.lower(),
+        "parser": parser,
+        "raw_char_count": len(raw_text),
+        "clean_char_count": len(clean_text),
+        "page_count": len(pages) if pages else 1,
+        "chunk_count": len(chunk_dicts),
+        "detected_sections": sorted({title for title in section_titles if title})[:20],
+        "raw_text_preview": _preview(raw_text),
+        "clean_text_preview": _preview(clean_text),
+        "page_samples": page_samples,
+        "chunk_samples": chunk_samples,
+        "entity_total": 0,
+        "entity_labels": {},
+        "sample_entities": [],
+    }
+
+
+def _refresh_runtime_pipeline():
+    """
+    Reload live in-memory indices after a full indexing run.
+
+    This keeps the API query pipeline in sync with newly processed documents
+    without requiring an application restart.
+    """
+    try:
+        from main import _pipeline_components
+
+        if not _pipeline_components:
+            return
+
+        vector_store = _pipeline_components.get("vector_store")
+        if vector_store is not None:
+            vector_store.index = None
+            vector_store._embeddings = None
+            vector_store.metadata = []
+            vector_store._load()
+
+        entity_index = _pipeline_components.get("entity_index")
+        if entity_index is not None:
+            entity_index._load()
+
+        dense_retriever = _pipeline_components.get("dense_retriever")
+        if dense_retriever is not None:
+            dense_retriever.rebuild_bm25()
+
+        logger.info("Refreshed live pipeline indices after ingestion")
+    except Exception as exc:
+        logger.warning(f"Could not refresh live pipeline indices: {exc}")
+
+
+def _process_document(file_path: Path) -> tuple[list[dict], dict]:
     """
     Process a single document through the full ingestion pipeline.
 
@@ -86,11 +275,21 @@ def _process_document(file_path: Path) -> list[dict]:
         pages = None
     else:
         logger.warning(f"  Unsupported file type: {suffix}")
-        return []
+        return [], {
+            "document_name": doc_name,
+            "document_type": suffix,
+            "parser": "unsupported",
+            "error": f"Unsupported file type: {suffix}",
+        }
 
     if not full_text.strip():
         logger.warning(f"  No text extracted from {doc_name}")
-        return []
+        return [], {
+            "document_name": doc_name,
+            "document_type": suffix,
+            "parser": "empty",
+            "error": "No text extracted",
+        }
 
     # Step 2: Clean
     clean_text = text_cleaner.clean(full_text)
@@ -99,9 +298,10 @@ def _process_document(file_path: Path) -> list[dict]:
     # Step 3: Chunk
     chunks = chunker.chunk_document(clean_text, doc_name, pages)
     chunk_dicts = [c.to_dict() for c in chunks]
+    trace = _build_document_trace(file_path, pages, full_text, clean_text, chunk_dicts)
 
     logger.info(f"  ✅ Created {len(chunk_dicts)} chunks from {doc_name}")
-    return chunk_dicts
+    return chunk_dicts, trace
 
 
 def _process_all_documents():
@@ -113,6 +313,8 @@ def _process_all_documents():
         "progress": 0,
         "message": "Starting document processing...",
         "documents": [],
+        "current_stage": "parsing",
+        "metrics": _build_metrics_snapshot(),
     }
 
     # Find all documents
@@ -126,25 +328,38 @@ def _process_all_documents():
             "progress": 0,
             "message": "No documents found in the documents directory.",
             "documents": [],
+            "current_stage": "idle",
+            "metrics": _build_metrics_snapshot(),
         }
         return
 
     all_chunks = []
+    traces = []
     total = len(doc_files)
 
     for i, file_path in enumerate(doc_files):
         _processing_status["message"] = f"Processing {file_path.name} ({i+1}/{total})"
         _processing_status["progress"] = (i / total) * 100
+        _processing_status["current_stage"] = "parsing"
 
         try:
-            chunks = _process_document(file_path)
+            chunks, trace = _process_document(file_path)
             all_chunks.extend(chunks)
+            traces.append(trace)
             _processing_status["documents"].append({
                 "name": file_path.name,
                 "chunks": len(chunks),
                 "status": "success",
             })
         except Exception as e:
+            traces.append(
+                {
+                    "document_name": file_path.name,
+                    "document_type": file_path.suffix.lower(),
+                    "parser": "error",
+                    "error": str(e),
+                }
+            )
             logger.error(f"  ❌ Error processing {file_path.name}: {e}")
             _processing_status["documents"].append({
                 "name": file_path.name,
@@ -154,10 +369,13 @@ def _process_all_documents():
 
     # Save all chunks
     _save_all_chunks(all_chunks)
+    _save_traces(traces)
 
     _processing_status["status"] = "completed"
     _processing_status["progress"] = 100
     _processing_status["message"] = f"Processed {total} documents → {len(all_chunks)} chunks"
+    _processing_status["current_stage"] = "processed"
+    _processing_status["metrics"] = _build_metrics_snapshot()
 
     logger.info(f"✅ Ingestion complete: {total} docs → {len(all_chunks)} chunks")
 
@@ -229,17 +447,22 @@ async def process_and_index(background_tasks: BackgroundTasks):
 
         _processing_status["message"] = "Building NER entity index..."
         _processing_status["status"] = "processing"
+        _processing_status["current_stage"] = "entity_indexing"
 
         # Load chunks
         chunks = _get_all_chunks()
         if not chunks:
             _processing_status["message"] = "No chunks to index"
+            _processing_status["metrics"] = _build_metrics_snapshot()
             return
 
         # Step 2: NER on all chunks → entity index
         rule_ner = RuleBasedNER()
         ml_ner = MLBasedNER()
         entity_idx = EntityIndex()
+        traces_by_doc = {
+            trace.get("document_name"): trace for trace in _load_traces() if trace.get("document_name")
+        }
 
         for chunk in chunks:
             text = chunk.get("text", "")
@@ -255,10 +478,29 @@ async def process_and_index(background_tasks: BackgroundTasks):
             chunk["entities"] = unique
             entity_idx.add_entities(chunk["chunk_id"], unique)
 
+            doc_trace = traces_by_doc.get(chunk.get("metadata", {}).get("doc_name"))
+            if doc_trace is not None:
+                doc_trace["entity_total"] = doc_trace.get("entity_total", 0) + len(unique)
+                label_counts = doc_trace.setdefault("entity_labels", {})
+                sample_entities = doc_trace.setdefault("sample_entities", [])
+                for entity in unique:
+                    label = entity.get("label", "UNKNOWN")
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                    if len(sample_entities) < 12:
+                        sample_entities.append(
+                            {
+                                "text": entity.get("text", ""),
+                                "label": label,
+                                "source": entity.get("source", ""),
+                            }
+                        )
+
         entity_idx.save()
         _save_all_chunks(chunks)
+        _save_traces(list(traces_by_doc.values()))
 
         _processing_status["message"] = "Building vector embeddings..."
+        _processing_status["current_stage"] = "vector_indexing"
 
         # Step 3: Embeddings → FAISS
         embedder = Embedder()
@@ -268,13 +510,16 @@ async def process_and_index(background_tasks: BackgroundTasks):
         embeddings = embedder.embed_batch(texts)
         store.build_index(embeddings, chunks)
         store.save()
+        _refresh_runtime_pipeline()
 
         _processing_status["status"] = "completed"
         _processing_status["progress"] = 100
+        _processing_status["current_stage"] = "completed"
         _processing_status["message"] = (
             f"Full pipeline complete: {len(chunks)} chunks indexed, "
             f"{len(entity_idx.index)} entities mapped"
         )
+        _processing_status["metrics"] = _build_metrics_snapshot()
         logger.info(f"✅ Full pipeline complete")
 
     background_tasks.add_task(full_pipeline)
@@ -285,6 +530,28 @@ async def process_and_index(background_tasks: BackgroundTasks):
 async def get_processing_status():
     """Get current document processing status."""
     return ProcessingStatus(**_processing_status)
+
+
+@router.get("/metrics")
+async def get_ingestion_metrics():
+    """Get detailed corpus and indexing metrics for the frontend."""
+    snapshot = _build_metrics_snapshot()
+    return {
+        "status": _processing_status.get("status", "idle"),
+        "current_stage": _processing_status.get("current_stage", "idle"),
+        "message": _processing_status.get("message", ""),
+        "metrics": snapshot,
+    }
+
+
+@router.get("/traces")
+async def get_ingestion_traces():
+    """Get detailed parser, cleaning, chunking, and NER traces per document."""
+    return {
+        "status": _processing_status.get("status", "idle"),
+        "current_stage": _processing_status.get("current_stage", "idle"),
+        "documents": _load_traces(),
+    }
 
 
 @router.get("/documents")

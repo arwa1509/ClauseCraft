@@ -95,7 +95,8 @@ class Embedder:
         if self.model is None:
             return np.array([self._fallback_embed(t) for t in texts])
 
-        logger.info(f"Embedding {len(texts)} texts (batch_size={batch_size})...")
+        if show_progress:
+            logger.info(f"Embedding {len(texts)} texts (batch_size={batch_size})...")
 
         embeddings = self.model.encode(
             texts,
@@ -105,7 +106,8 @@ class Embedder:
             show_progress_bar=show_progress,
         )
 
-        logger.info(f"✅ Generated {len(embeddings)} embeddings (dim={self.dimension})")
+        if show_progress:
+            logger.info(f"✅ Generated {len(embeddings)} embeddings (dim={self.dimension})")
         return embeddings
 
     def _fallback_embed(self, text: str) -> np.ndarray:

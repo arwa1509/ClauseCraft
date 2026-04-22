@@ -1,12 +1,7 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Scale, Search, FileText, ShieldCheck } from 'lucide-react';
-import { clsx } from 'clsx';
-import { twMerge } from 'tailwind-merge';
-
-function cn(...inputs) {
-  return twMerge(clsx(inputs));
-}
+import { cn } from '../utils/cn';
 
 const Layout = ({ children }) => {
   const location = useLocation();
@@ -28,7 +23,7 @@ const Layout = ({ children }) => {
                   <Scale className="h-6 w-6 text-white" />
                 </div>
                 <span className="text-xl font-bold text-legal-900 tracking-tight">
-                  Lex<span className="text-brand-600">Analyze</span>
+                  Clause<span className="text-brand-600">Craft</span>
                 </span>
               </Link>
               
@@ -57,7 +52,7 @@ const Layout = ({ children }) => {
             <div className="flex items-center space-x-4">
               <div className="hidden md:flex items-center space-x-2 bg-green-50 px-3 py-1 rounded-full border border-green-100">
                 <ShieldCheck className="h-4 w-4 text-green-600" />
-                <span className="text-xs font-medium text-green-700">Verifiable System</span>
+                <span className="text-xs font-medium text-green-700">Grounded Answers</span>
               </div>
             </div>
           </div>
@@ -80,11 +75,11 @@ const Layout = ({ children }) => {
       <footer className="bg-white border-t border-legal-200 py-8">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0 text-sm text-legal-500">
-            <p>&copy; 2026 LexAnalyze AI. Production-Grade Legal NLP Pipeline.</p>
+            <p>&copy; 2026 ClauseCraft. Grounded legal document analysis.</p>
             <div className="flex space-x-6">
-              <a href="#" className="hover:text-legal-900 transition-colors">API Documentation</a>
-              <a href="#" className="hover:text-legal-900 transition-colors">Methodology</a>
-              <a href="#" className="hover:text-legal-900 transition-colors">Github</a>
+              <span className="hover:text-legal-900 transition-colors">API Documentation</span>
+              <span className="hover:text-legal-900 transition-colors">Methodology</span>
+              <span className="hover:text-legal-900 transition-colors">GitHub</span>
             </div>
           </div>
         </div>
