@@ -59,6 +59,12 @@ logger.add(str(LOG_FILE), rotation="10 MB", retention="7 days", level="DEBUG")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("ClauseCraft starting up")
+    if QUERY_HISTORY_PATH.exists():
+        try:
+            QUERY_HISTORY_PATH.unlink()
+            logger.info("Cleared previous query history for a fresh session")
+        except Exception as exc:
+            logger.warning(f"Could not clear query history on startup: {exc}")
     yield
     logger.info("ClauseCraft shutting down")
 

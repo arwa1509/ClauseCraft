@@ -11,27 +11,30 @@ const WELCOME_MESSAGE = {
   content: "Ask about the indexed legal documents and I will answer from supported passages only.",
 };
 
+const normalizeDisplayScore = (score) => {
+  if (typeof score !== "number" || Number.isNaN(score)) {
+    return null;
+  }
+  if (score >= 0 && score <= 1) {
+    return score;
+  }
+  return 1 / (1 + Math.exp(-score));
+};
+
+const formatRelevanceLabel = (score) => {
+  const normalized = normalizeDisplayScore(score);
+  if (normalized === null) {
+    return "Relevance unavailable";
+  }
+  return `Relevance ${Math.round(normalized * 100)}%`;
+};
+
 const QueryPage = () => {
-  const [messages, setMessages] = useState(() => {
-    try {
-      const saved = localStorage.getItem("clausecraft-messages");
-      return saved ? JSON.parse(saved) : [WELCOME_MESSAGE];
-    } catch {
-      return [WELCOME_MESSAGE];
-    }
-  });
+  const [messages, setMessages] = useState([WELCOME_MESSAGE]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const messagesEndRef = useRef(null);
   const abortControllerRef = useRef(null);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem("clausecraft-messages", JSON.stringify(messages));
-    } catch {
-      // ignore storage quota errors
-    }
-  }, [messages]);
 
   const API_BASE = `${import.meta.env.VITE_API_BASE || "http://localhost:8000"}/api`;
 
@@ -303,7 +306,7 @@ const QueryPage = () => {
                             <div key={`${msg.id}-passage-${passage.chunk_id || idx}`} className="rounded-lg border border-legal-100 bg-white p-3">
                               <div className="flex items-center justify-between text-[11px] text-legal-500 mb-2">
                                 <span>{passage.metadata?.doc_name || "Local document"}</span>
-                                <span>Score {Math.round((passage.score || 0) * 100)}%</span>
+                                <span>{formatRelevanceLabel(passage.score)}</span>
                               </div>
                               <p className="text-sm text-legal-700 leading-relaxed font-serif">{passage.text}</p>
                             </div>
@@ -380,7 +383,7 @@ const QueryPage = () => {
                             <div key={`${msg.id}-source-${source.chunk_id || idx}`} className="rounded-lg border border-legal-100 bg-white p-3">
                               <div className="flex items-center justify-between text-[11px] text-legal-500 mb-2">
                                 <span>{source.metadata?.doc_name || "Local document"}</span>
-                                <span>Score {Math.round((source.score || 0) * 100)}%</span>
+                                <span>{formatRelevanceLabel(source.score)}</span>
                               </div>
                               <p className="text-sm text-legal-700 leading-relaxed font-serif">{source.text}</p>
                               {source.entities?.length > 0 && (
